@@ -4,13 +4,16 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from overwatch.cli import _format_review_thread
 from overwatch.github import (
     CiStatus,
     CodexReviewDecision,
     PullRequestRef,
+    ReviewThread,
     _body_says_codex_approved,
     _rollup_state,
     _summarize_status,
+    _unresolved_review_threads,
     parse_pr_url,
 )
 from overwatch.providers import AgentConfig, ProviderRegistry
@@ -109,6 +112,66 @@ class CiStatusTest(unittest.TestCase):
 
     def test_codex_actionable_feedback_is_not_approval(self) -> None:
         self.assertFalse(_body_says_codex_approved("Codex review: please fix the failing test."))
+
+    def test_unresolved_review_threads_ignores_resolved_threads(self) -> None:
+        threads = _unresolved_review_threads(
+            [
+                {
+                    "isResolved": True,
+                    "path": "src/example.py",
+                    "line": 10,
+                    "comments": {
+                        "nodes": [
+                            {
+                                "author": {"login": "codex"},
+                                "body": "Resolved comment",
+                                "url": "https://github.com/example/repo/pull/1#discussion_r1",
+                                "createdAt": "2026-05-15T00:00:00Z",
+                            }
+                        ]
+                    },
+                },
+                {
+                    "isResolved": False,
+                    "path": "src/example.py",
+                    "line": 12,
+                    "comments": {
+                        "nodes": [
+                            {
+                                "author": {"login": "codex"},
+                                "body": "Please remove this smoke test.",
+                                "url": "https://github.com/example/repo/pull/1#discussion_r2",
+                                "createdAt": "2026-05-15T00:01:00Z",
+                            }
+                        ]
+                    },
+                },
+            ]
+        )
+
+        self.assertEqual(len(threads), 1)
+        self.assertEqual(threads[0].author, "codex")
+        self.assertEqual(threads[0].body, "Please remove this smoke test.")
+
+
+class CliTest(unittest.TestCase):
+    def test_format_review_thread_includes_location_author_and_url(self) -> None:
+        line = _format_review_thread(
+            ReviewThread(
+                author="codex",
+                body="Please remove this smoke test.",
+                url="https://github.com/example/repo/pull/1#discussion_r2",
+                path="src/example.py",
+                line=12,
+                created_at="2026-05-15T00:01:00Z",
+            )
+        )
+
+        self.assertEqual(
+            line,
+            "codex src/example.py:12: Please remove this smoke test. "
+            "https://github.com/example/repo/pull/1#discussion_r2",
+        )
 
 
 class StoreTest(unittest.TestCase):

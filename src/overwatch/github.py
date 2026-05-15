@@ -33,6 +33,16 @@ class CodexReviewDecision:
     summary: str
 
 
+@dataclass(frozen=True, slots=True)
+class ReviewThread:
+    author: str
+    body: str
+    url: str
+    path: str | None
+    line: int | None
+    created_at: str
+
+
 def parse_pr_url(url: str) -> PullRequestRef:
     parsed = urllib.parse.urlparse(url)
     if parsed.netloc.lower() != "github.com":
@@ -104,6 +114,42 @@ class GitHubClient:
     def merge_pr(self, pr: PullRequestRef) -> None:
         self._request(f"/repos/{pr.owner}/{pr.repo}/pulls/{pr.number}/merge", method="PUT", data={})
 
+    def get_unresolved_review_threads(self, pr: PullRequestRef) -> list[ReviewThread]:
+        data = self._graphql(
+            """
+            query($owner: String!, $repo: String!, $number: Int!) {
+              repository(owner: $owner, name: $repo) {
+                pullRequest(number: $number) {
+                  reviewThreads(first: 100) {
+                    nodes {
+                      isResolved
+                      isOutdated
+                      path
+                      line
+                      comments(last: 1) {
+                        nodes {
+                          author { login }
+                          body
+                          url
+                          createdAt
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            """,
+            {"owner": pr.owner, "repo": pr.repo, "number": pr.number},
+        )
+        threads = (
+            data.get("repository", {})
+            .get("pullRequest", {})
+            .get("reviewThreads", {})
+            .get("nodes", [])
+        )
+        return _unresolved_review_threads(threads)
+
     def _request(
         self,
         path: str,
@@ -133,6 +179,47 @@ class GitHubClient:
             return self._request(path)
         except RuntimeError as exc:
             return {"error": str(exc)}
+
+    def _graphql(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
+        response = self._request(
+            "/graphql",
+            method="POST",
+            data={"query": query, "variables": variables},
+        )
+        if not isinstance(response, dict):
+            raise RuntimeError("GitHub GraphQL response was not an object")
+        if response.get("errors"):
+            raise RuntimeError(f"GitHub GraphQL error: {response['errors']}")
+        data = response.get("data")
+        if not isinstance(data, dict):
+            raise RuntimeError("GitHub GraphQL response did not include data")
+        return data
+
+
+def _unresolved_review_threads(threads: object) -> list[ReviewThread]:
+    unresolved: list[ReviewThread] = []
+    for thread in threads if isinstance(threads, list) else []:
+        if not isinstance(thread, dict) or thread.get("isResolved"):
+            continue
+        comments = thread.get("comments") or {}
+        nodes = comments.get("nodes") if isinstance(comments, dict) else []
+        if not isinstance(nodes, list) or not nodes:
+            continue
+        comment = nodes[-1]
+        if not isinstance(comment, dict):
+            continue
+        author = comment.get("author") or {}
+        unresolved.append(
+            ReviewThread(
+                author=str(author.get("login") or "unknown"),
+                body=str(comment.get("body") or ""),
+                url=str(comment.get("url") or ""),
+                path=str(thread["path"]) if thread.get("path") else None,
+                line=int(thread["line"]) if thread.get("line") else None,
+                created_at=str(comment.get("createdAt") or ""),
+            )
+        )
+    return unresolved
 
 
 def _codex_review_items(reviews: object, comments: object) -> list[dict[str, Any]]:

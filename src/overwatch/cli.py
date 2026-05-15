@@ -4,7 +4,7 @@ import argparse
 import asyncio
 from pathlib import Path
 
-from overwatch.github import parse_pr_url
+from overwatch.github import GitHubClient, PullRequestRef, ReviewThread, parse_pr_url
 from overwatch.store import Store, default_db_path
 from overwatch.worker import run_forever, run_once
 
@@ -63,14 +63,38 @@ def _print_watched_prs(store: Store, *, include_inactive: bool) -> None:
         print("No watched PRs.")
         return
 
-    print("STATUS   CI       PR  PROVIDER  MODEL  URL")
+    github = GitHubClient()
+    print("STATUS   CI       PR  PROVIDER  MODEL  COMMENTS  URL")
     for row in rows:
         ci_state = row.latest_ci_state or "unknown"
         model = row.model or "-"
+        pr = PullRequestRef(owner=row.owner, repo=row.repo, number=row.number, url=row.url)
+        comment_count, comment_lines = _unresolved_comment_lines(github, pr)
         print(
             f"{row.status:<8} {ci_state:<8} "
-            f"#{row.number:<3} {row.provider:<9} {model:<6} {row.url}"
+            f"#{row.number:<3} {row.provider:<9} {model:<6} "
+            f"{comment_count:<8} {row.url}"
         )
+        for line in comment_lines:
+            print(f"  {line}")
+
+
+def _unresolved_comment_lines(github: GitHubClient, pr: PullRequestRef) -> tuple[str, list[str]]:
+    try:
+        threads = github.get_unresolved_review_threads(pr)
+    except RuntimeError as exc:
+        return "?", [f"comments unavailable: {exc}"]
+    return str(len(threads)), [_format_review_thread(thread) for thread in threads]
+
+
+def _format_review_thread(thread: ReviewThread) -> str:
+    location = ""
+    if thread.path and thread.line:
+        location = f" {thread.path}:{thread.line}"
+    body = " ".join(thread.body.split())
+    if len(body) > 160:
+        body = body[:157] + "..."
+    return f"{thread.author}{location}: {body} {thread.url}".strip()
 
 
 if __name__ == "__main__":
