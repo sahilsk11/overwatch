@@ -4,7 +4,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from overwatch.github import CiStatus, PullRequestRef, parse_pr_url
+from overwatch.github import (
+    CiStatus,
+    PullRequestRef,
+    _rollup_state,
+    _summarize_status,
+    parse_pr_url,
+)
 from overwatch.providers import AgentConfig, ProviderRegistry
 from overwatch.store import Store
 from overwatch.worker import run_once
@@ -41,6 +47,27 @@ class ParsePrUrlTest(unittest.TestCase):
     def test_rejects_non_pr_url(self) -> None:
         with self.assertRaises(ValueError):
             parse_pr_url("https://github.com/example/repo/issues/42")
+
+
+class CiStatusTest(unittest.TestCase):
+    def test_actions_failure_marks_ci_failed(self) -> None:
+        combined = {"state": "pending", "statuses": []}
+        checks = {"error": "check-runs unavailable"}
+        actions = {
+            "workflow_runs": [
+                {
+                    "name": "CI",
+                    "status": "completed",
+                    "conclusion": "failure",
+                    "html_url": "https://github.com/example/repo/actions/runs/1",
+                }
+            ]
+        }
+
+        self.assertEqual(_rollup_state(combined, checks, actions), "failure")
+        summary = _summarize_status(combined, checks, actions)
+
+        self.assertIn("workflow CI: completed failure", summary)
 
 
 class StoreTest(unittest.TestCase):
