@@ -23,6 +23,8 @@ class CiStatus:
     head_sha: str
     summary: str
     details: dict[str, Any]
+    pr_state: str = "open"
+    merged: bool = False
 
 
 def parse_pr_url(url: str) -> PullRequestRef:
@@ -72,6 +74,8 @@ class GitHubClient:
             head_sha=head_sha,
             summary=summary,
             details={"combined_status": combined, "check_runs": checks, "actions": actions},
+            pr_state=str(pull.get("state", "open")),
+            merged=bool(pull.get("merged")),
         )
 
     def _request(self, path: str) -> dict[str, Any]:
