@@ -109,15 +109,17 @@ def _rollup_state(
         run.get("conclusion") for run in workflow_runs if run.get("status") == "completed"
     }
     workflows_in_progress = any(run.get("status") != "completed" for run in workflow_runs)
+    statuses = combined.get("statuses") or []
+    legacy_status_pending = bool(statuses) and combined.get("state") == "pending"
 
     failing_conclusions = {"failure", "cancelled", "timed_out", "action_required"}
     if (conclusions | workflow_conclusions) & failing_conclusions:
         return "failure"
     if combined.get("state") in {"failure", "error"}:
         return "failure"
-    if in_progress or workflows_in_progress or combined.get("state") == "pending":
+    if in_progress or workflows_in_progress or legacy_status_pending:
         return "pending"
-    if check_runs or workflow_runs or combined.get("statuses"):
+    if check_runs or workflow_runs or statuses:
         return "success"
     return "unknown"
 
