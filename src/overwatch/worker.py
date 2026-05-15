@@ -77,5 +77,6 @@ CI summary:
 {summary}
 
 Diagnose the failure, make the smallest correct code change, and run the relevant tests.
+If you are in the target repository on the PR branch, commit the fix and push it.
 Do not amend commits or force push.
 """
