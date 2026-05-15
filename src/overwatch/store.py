@@ -26,6 +26,8 @@ class WatchedPullRequest:
     provider: str
     model: str | None
     harness: str | None
+    autofix: bool
+    merge_on_bot_approval: bool
     created_at: str
     updated_at: str
 
@@ -41,6 +43,8 @@ class WatchedPullRequestSummary:
     provider: str
     model: str | None
     harness: str | None
+    autofix: bool
+    merge_on_bot_approval: bool
     latest_ci_state: str | None
     latest_head_sha: str | None
     latest_summary: str | None
@@ -99,6 +103,13 @@ class Store:
                 );
                 """
             )
+            _ensure_column(
+                conn,
+                "watched_prs",
+                "merge_on_bot_approval",
+                "integer not null default 0",
+            )
+            _ensure_column(conn, "watched_prs", "autofix", "integer not null default 0")
 
     def watch_pr(
         self,
@@ -107,6 +118,8 @@ class Store:
         provider: str,
         model: str | None,
         harness: str | None,
+        autofix: bool = False,
+        merge_on_bot_approval: bool = False,
     ) -> WatchedPullRequest:
         self.init()
         now = _now()
@@ -114,16 +127,31 @@ class Store:
             conn.execute(
                 """
                 insert into watched_prs
-                    (url, owner, repo, number, provider, model, harness, created_at, updated_at)
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (url, owner, repo, number, provider, model, harness,
+                     autofix, merge_on_bot_approval, created_at, updated_at)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 on conflict(url) do update set
                     status = 'unresolved',
                     provider = excluded.provider,
                     model = excluded.model,
                     harness = excluded.harness,
+                    autofix = excluded.autofix,
+                    merge_on_bot_approval = excluded.merge_on_bot_approval,
                     updated_at = excluded.updated_at
                 """,
-                (pr.url, pr.owner, pr.repo, pr.number, provider, model, harness, now, now),
+                (
+                    pr.url,
+                    pr.owner,
+                    pr.repo,
+                    pr.number,
+                    provider,
+                    model,
+                    harness,
+                    int(autofix),
+                    int(merge_on_bot_approval),
+                    now,
+                    now,
+                ),
             )
             row = conn.execute("select * from watched_prs where url = ?", (pr.url,)).fetchone()
         return _watched_pr(row)
@@ -153,6 +181,8 @@ class Store:
                     watched_prs.provider,
                     watched_prs.model,
                     watched_prs.harness,
+                    watched_prs.autofix,
+                    watched_prs.merge_on_bot_approval,
                     latest.state as latest_ci_state,
                     latest.head_sha as latest_head_sha,
                     latest.summary as latest_summary,
@@ -241,11 +271,23 @@ class Store:
 
 
 def _watched_pr(row: sqlite3.Row) -> WatchedPullRequest:
-    return WatchedPullRequest(**{key: row[key] for key in row.keys()})
+    values = {key: row[key] for key in row.keys()}
+    values["autofix"] = bool(values["autofix"])
+    values["merge_on_bot_approval"] = bool(values["merge_on_bot_approval"])
+    return WatchedPullRequest(**values)
 
 
 def _watched_pr_summary(row: sqlite3.Row) -> WatchedPullRequestSummary:
-    return WatchedPullRequestSummary(**{key: row[key] for key in row.keys()})
+    values = {key: row[key] for key in row.keys()}
+    values["autofix"] = bool(values["autofix"])
+    values["merge_on_bot_approval"] = bool(values["merge_on_bot_approval"])
+    return WatchedPullRequestSummary(**values)
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    columns = {row["name"] for row in conn.execute(f"pragma table_info({table})")}
+    if column not in columns:
+        conn.execute(f"alter table {table} add column {column} {definition}")
 
 
 def _now() -> str:

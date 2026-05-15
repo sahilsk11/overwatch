@@ -4,7 +4,7 @@ import argparse
 import asyncio
 from pathlib import Path
 
-from overwatch.github import parse_pr_url
+from overwatch.github import GitHubClient, PullRequestRef, ReviewThread, parse_pr_url
 from overwatch.store import Store, default_db_path
 from overwatch.worker import run_forever, run_once
 
@@ -21,6 +21,16 @@ def main() -> None:
     )
     parser.add_argument("--model", help="Model to pass to the coding agent")
     parser.add_argument("--harness", help="Harness name to pass to the coding agent")
+    parser.add_argument(
+        "--autofix",
+        action="store_true",
+        help="Run the configured coding agent for failing CI or unresolved review comments",
+    )
+    parser.add_argument(
+        "--merge-on-bot-approval",
+        action="store_true",
+        help="Merge after CI passes if the latest supported bot review approves the PR",
+    )
     parser.add_argument("--run-once", action="store_true", help="Check unresolved PRs once")
     parser.add_argument("--worker", action="store_true", help="Run the polling worker")
     parser.add_argument("--interval", type=int, default=300, help="Worker interval in seconds")
@@ -42,7 +52,14 @@ def main() -> None:
         parser.error("provide a GitHub PR URL, 'list', --run-once, or --worker")
 
     pr = parse_pr_url(args.pr_link)
-    watched = store.watch_pr(pr, provider=args.provider, model=args.model, harness=args.harness)
+    watched = store.watch_pr(
+        pr,
+        provider=args.provider,
+        model=args.model,
+        harness=args.harness,
+        autofix=args.autofix,
+        merge_on_bot_approval=args.merge_on_bot_approval,
+    )
     print(f"watching {watched.url} with {watched.provider}")
 
 
@@ -52,14 +69,38 @@ def _print_watched_prs(store: Store, *, include_inactive: bool) -> None:
         print("No watched PRs.")
         return
 
-    print("STATUS   CI       PR  PROVIDER  MODEL  URL")
+    github = GitHubClient()
+    print("STATUS   CI       PR  PROVIDER  MODEL  COMMENTS  URL")
     for row in rows:
         ci_state = row.latest_ci_state or "unknown"
         model = row.model or "-"
+        pr = PullRequestRef(owner=row.owner, repo=row.repo, number=row.number, url=row.url)
+        comment_count, comment_lines = _unresolved_comment_lines(github, pr)
         print(
             f"{row.status:<8} {ci_state:<8} "
-            f"#{row.number:<3} {row.provider:<9} {model:<6} {row.url}"
+            f"#{row.number:<3} {row.provider:<9} {model:<6} "
+            f"{comment_count:<8} {row.url}"
         )
+        for line in comment_lines:
+            print(f"  {line}")
+
+
+def _unresolved_comment_lines(github: GitHubClient, pr: PullRequestRef) -> tuple[str, list[str]]:
+    try:
+        threads = github.get_unresolved_review_threads(pr)
+    except RuntimeError as exc:
+        return "?", [f"comments unavailable: {exc}"]
+    return str(len(threads)), [_format_review_thread(thread) for thread in threads]
+
+
+def _format_review_thread(thread: ReviewThread) -> str:
+    location = ""
+    if thread.path and thread.line:
+        location = f" {thread.path}:{thread.line}"
+    body = " ".join(thread.body.split())
+    if len(body) > 160:
+        body = body[:157] + "..."
+    return f"{thread.author}{location}: {body} {thread.url}".strip()
 
 
 if __name__ == "__main__":
