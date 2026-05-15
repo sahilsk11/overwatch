@@ -105,6 +105,8 @@ def _review_threads_for_work(
     try:
         return github.get_unresolved_review_threads(pr)
     except RuntimeError:
+        if watched.merge_on_bot_approval:
+            raise
         return []
 
 

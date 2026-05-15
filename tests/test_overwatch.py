@@ -8,9 +8,11 @@ from overwatch.cli import _format_review_thread
 from overwatch.github import (
     CiStatus,
     CodexReviewDecision,
+    GitHubClient,
     PullRequestRef,
     ReviewThread,
     _body_says_codex_approved,
+    _is_codex_authored,
     _rollup_state,
     _summarize_status,
     _unresolved_review_threads,
@@ -27,10 +29,12 @@ class FakeGitHubClient:
         status: CiStatus,
         decision: CodexReviewDecision | None = None,
         review_threads: list[ReviewThread] | None = None,
+        review_threads_error: RuntimeError | None = None,
     ) -> None:
         self.status = status
         self.decision = decision or CodexReviewDecision(approved=False, summary="No approval")
         self.review_threads = review_threads or []
+        self.review_threads_error = review_threads_error
         self.checked: list[PullRequestRef] = []
         self.reviewed: list[PullRequestRef] = []
         self.thread_checked: list[PullRequestRef] = []
@@ -47,6 +51,8 @@ class FakeGitHubClient:
 
     def get_unresolved_review_threads(self, pr: PullRequestRef) -> list[ReviewThread]:
         self.thread_checked.append(pr)
+        if self.review_threads_error:
+            raise self.review_threads_error
         return self.review_threads
 
     def merge_pr(self, pr: PullRequestRef) -> None:
@@ -166,6 +172,41 @@ class CiStatusTest(unittest.TestCase):
         self.assertEqual(threads[0].id, "THREAD2")
         self.assertEqual(threads[0].author, "codex")
         self.assertEqual(threads[0].body, "Please remove this smoke test.")
+
+
+class GitHubClientTest(unittest.TestCase):
+    def test_request_all_pages_follows_link_header(self) -> None:
+        class PagingClient(GitHubClient):
+            def __init__(self) -> None:
+                super().__init__(token="token", api_url="https://api.github.test")
+                self.calls: list[str] = []
+
+            def _request_page(
+                self,
+                path: str,
+                *,
+                method: str = "GET",
+                data: dict[str, object] | None = None,
+            ) -> tuple[list[dict[str, object]], dict[str, str]]:
+                self.calls.append(path)
+                if path == "/first":
+                    return (
+                        [{"id": 1}],
+                        {"Link": '<https://api.github.test/second>; rel="next"'},
+                    )
+                if path == "https://api.github.test/second":
+                    return ([{"id": 2}], {})
+                raise AssertionError(f"unexpected path: {path}")
+
+        client = PagingClient()
+
+        self.assertEqual(client._request_all_pages("/first"), [{"id": 1}, {"id": 2}])
+        self.assertEqual(client.calls, ["/first", "https://api.github.test/second"])
+
+    def test_codex_author_requires_trusted_login(self) -> None:
+        self.assertTrue(_is_codex_authored({"user": {"login": "codex"}}))
+        self.assertTrue(_is_codex_authored({"user": {"login": "chatgpt-codex-connector"}}))
+        self.assertFalse(_is_codex_authored({"user": {"login": "alice-codex-fan"}}))
 
 
 class CliTest(unittest.TestCase):
@@ -308,6 +349,30 @@ class WorkerTest(unittest.IsolatedAsyncioTestCase):
             await run_once(store, github=github, registry=ProviderRegistry([FakeProvider()]))
 
             self.assertEqual(len(github.reviewed), 1)
+            self.assertEqual(len(github.merged), 0)
+            self.assertEqual(store.watched_prs()[0].status, "unresolved")
+
+    async def test_review_thread_failure_blocks_merge_on_bot_approval(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = Store(Path(tmpdir) / "overwatch.sqlite3")
+            pr = parse_pr_url("https://github.com/example/repo/pull/42")
+            store.watch_pr(
+                pr,
+                provider="opencode",
+                model=None,
+                harness=None,
+                merge_on_bot_approval=True,
+            )
+            github = FakeGitHubClient(
+                CiStatus(state="success", head_sha="abc123", summary="tests passed", details={}),
+                CodexReviewDecision(approved=True, summary="Codex review: no major issues"),
+                review_threads_error=RuntimeError("GraphQL unavailable"),
+            )
+
+            with self.assertRaises(RuntimeError):
+                await run_once(store, github=github, registry=ProviderRegistry([FakeProvider()]))
+
+            self.assertEqual(len(github.reviewed), 0)
             self.assertEqual(len(github.merged), 0)
             self.assertEqual(store.watched_prs()[0].status, "unresolved")
 

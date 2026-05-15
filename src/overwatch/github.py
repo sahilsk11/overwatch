@@ -45,6 +45,9 @@ class ReviewThread:
     created_at: str
 
 
+TRUSTED_CODEX_LOGINS = frozenset({"codex", "chatgpt-codex-connector"})
+
+
 def parse_pr_url(url: str) -> PullRequestRef:
     parsed = urllib.parse.urlparse(url)
     if parsed.netloc.lower() != "github.com":
@@ -98,7 +101,9 @@ class GitHubClient:
 
     def get_codex_review_decision(self, pr: PullRequestRef) -> CodexReviewDecision:
         reviews = self._request_all_pages(f"/repos/{pr.owner}/{pr.repo}/pulls/{pr.number}/reviews")
-        comments = self._request_all_pages(f"/repos/{pr.owner}/{pr.repo}/issues/{pr.number}/comments")
+        comments = self._request_all_pages(
+            f"/repos/{pr.owner}/{pr.repo}/issues/{pr.number}/comments"
+        )
         codex_items = _codex_review_items(reviews, comments)
         if not codex_items:
             return CodexReviewDecision(approved=False, summary="No Codex review comments found.")
@@ -167,8 +172,18 @@ class GitHubClient:
         method: str = "GET",
         data: dict[str, Any] | None = None,
     ) -> dict[str, Any] | list[dict[str, Any]]:
+        payload, _headers = self._request_page(path, method=method, data=data)
+        return payload
+
+    def _request_page(
+        self,
+        path: str,
+        *,
+        method: str = "GET",
+        data: dict[str, Any] | None = None,
+    ) -> tuple[dict[str, Any] | list[dict[str, Any]], Any]:
         body = json.dumps(data).encode("utf-8") if data is not None else None
-        request = urllib.request.Request(self._api_url + path, data=body, method=method)
+        request = urllib.request.Request(self._request_url(path), data=body, method=method)
         request.add_header("Accept", "application/vnd.github+json")
         request.add_header("User-Agent", "overwatch")
         request.add_header("X-GitHub-Api-Version", "2022-11-28")
@@ -179,10 +194,16 @@ class GitHubClient:
 
         try:
             with urllib.request.urlopen(request, timeout=30) as response:
-                return json.loads(response.read().decode("utf-8"))
+                return json.loads(response.read().decode("utf-8")), response.headers
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
             raise RuntimeError(f"GitHub API error {exc.code} for {path}: {body}") from exc
+
+    def _request_url(self, path: str) -> str:
+        parsed = urllib.parse.urlparse(path)
+        if parsed.scheme and parsed.netloc:
+            return path
+        return self._api_url + path
 
     def _request_optional(self, path: str) -> dict[str, Any]:
         try:
@@ -194,21 +215,15 @@ class GitHubClient:
         results: list[dict[str, Any]] = []
         next_path = path
         while next_path:
-            response = self._request_raw(next_path)
+            response, headers = self._request_page(next_path)
             if isinstance(response, list):
                 results.extend(response)
             else:
                 results.append(response)
-            next_path = self._next_page_link(response)
+            next_path = self._next_page_link(headers.get("Link"))
         return results
 
-    def _request_raw(self, path: str) -> dict[str, Any] | list[dict[str, Any]]:
-        return self._request(path)
-
-    def _next_page_link(self, response: dict[str, Any] | list[dict[str, Any]]) -> str | None:
-        if not isinstance(response, dict):
-            return None
-        link_header = response.get("link") or response.get("Link")
+    def _next_page_link(self, link_header: str | None) -> str | None:
         if not link_header:
             return None
         for part in link_header.split(","):
@@ -287,7 +302,7 @@ def _codex_review_items(reviews: object, comments: object) -> list[dict[str, Any
 def _is_codex_authored(item: dict[str, Any]) -> bool:
     user = item.get("user") or {}
     login = str(user.get("login") or "").lower()
-    return login == "codex"
+    return login in TRUSTED_CODEX_LOGINS
 
 
 def _body_says_codex_approved(body: str) -> bool:
