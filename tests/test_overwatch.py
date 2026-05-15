@@ -66,7 +66,7 @@ class FakeGitHubClient:
         self.merged.append(pr)
         self.merge_head_shas.append(head_sha)
 
-    def request_codex_review(self, pr: PullRequestRef) -> None:
+    def request_codex_review(self, pr: PullRequestRef, head_sha: str | None = None) -> None:
         self.review_requests.append(pr)
 
 
@@ -275,6 +275,17 @@ class GitHubClientTest(unittest.TestCase):
 
     def test_codex_review_decision_requires_current_head_review(self) -> None:
         class ReviewClient(GitHubClient):
+            def _request(
+                self,
+                path: str,
+                *,
+                method: str = "GET",
+                data: dict[str, object] | None = None,
+            ) -> dict[str, object]:
+                if path != "/repos/example/repo/commits/current-sha":
+                    raise AssertionError(f"unexpected path: {path}")
+                return {"commit": {"committer": {"date": "2026-05-15T00:00:30Z"}}}
+
             def _request_all_pages(self, path: str) -> list[dict[str, object]]:
                 if path.endswith("/reviews"):
                     return [
@@ -297,7 +308,7 @@ class GitHubClientTest(unittest.TestCase):
                     {
                         "user": {"login": "codex"},
                         "body": "Codex review: didn't find any major issues.",
-                        "created_at": "2026-05-15T00:02:00Z",
+                        "created_at": "2026-05-15T00:00:01Z",
                     }
                 ]
 
@@ -310,6 +321,44 @@ class GitHubClientTest(unittest.TestCase):
 
         self.assertFalse(decision.approved)
         self.assertEqual(decision.summary, "Please fix this.")
+
+    def test_codex_review_decision_accepts_current_head_issue_comment(self) -> None:
+        class CommentClient(GitHubClient):
+            def _request(
+                self,
+                path: str,
+                *,
+                method: str = "GET",
+                data: dict[str, object] | None = None,
+            ) -> dict[str, object]:
+                if path != "/repos/example/repo/commits/current-sha":
+                    raise AssertionError(f"unexpected path: {path}")
+                return {"commit": {"committer": {"date": "2026-05-15T00:01:00Z"}}}
+
+            def _request_all_pages(self, path: str) -> list[dict[str, object]]:
+                if path.endswith("/reviews"):
+                    return []
+                return [
+                    {
+                        "user": {"login": "sahilsk11"},
+                        "body": "@codex review\n\nHead SHA: current-sha",
+                        "created_at": "2026-05-15T00:01:30Z",
+                    },
+                    {
+                        "user": {"login": "codex"},
+                        "body": "Codex review: didn't find any major issues.",
+                        "created_at": "2026-05-15T00:02:00Z",
+                    },
+                ]
+
+        client = CommentClient(token="token")
+
+        decision = client.get_codex_review_decision(
+            PullRequestRef("example", "repo", 42, "https://github.com/example/repo/pull/42"),
+            "current-sha",
+        )
+
+        self.assertTrue(decision.approved)
 
     def test_codex_author_requires_trusted_login(self) -> None:
         self.assertTrue(_is_codex_authored({"user": {"login": "codex"}}))
@@ -462,7 +511,7 @@ class WorkerTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(github.merged), 0)
             self.assertEqual(store.watched_prs()[0].status, "unresolved")
 
-    async def test_review_thread_failure_blocks_merge_on_bot_approval(self) -> None:
+    async def test_review_thread_failure_defers_merge_on_bot_approval(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = Store(Path(tmpdir) / "overwatch.sqlite3")
             pr = parse_pr_url("https://github.com/example/repo/pull/42")
@@ -479,12 +528,36 @@ class WorkerTest(unittest.IsolatedAsyncioTestCase):
                 review_threads_error=RuntimeError("GraphQL unavailable"),
             )
 
-            with self.assertRaises(RuntimeError):
-                await run_once(store, github=github, registry=ProviderRegistry([FakeProvider()]))
+            await run_once(store, github=github, registry=ProviderRegistry([FakeProvider()]))
 
             self.assertEqual(len(github.reviewed), 0)
             self.assertEqual(len(github.merged), 0)
             self.assertEqual(store.watched_prs()[0].status, "unresolved")
+
+    async def test_review_thread_failure_still_allows_ci_autofix(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = Store(Path(tmpdir) / "overwatch.sqlite3")
+            pr = parse_pr_url("https://github.com/example/repo/pull/42")
+            store.watch_pr(
+                pr,
+                provider="opencode",
+                model=None,
+                harness=None,
+                autofix=True,
+                merge_on_bot_approval=True,
+            )
+            github = FakeGitHubClient(
+                CiStatus(state="failure", head_sha="abc123", summary="tests failed", details={}),
+                review_threads_error=RuntimeError("GraphQL unavailable"),
+            )
+            provider = FakeProvider()
+
+            await run_once(store, github=github, registry=ProviderRegistry([provider]))
+
+            self.assertEqual(len(provider.calls), 1)
+            prompt, _config = provider.calls[0]
+            self.assertIn("CI failure:", prompt)
+            self.assertIn("tests failed", prompt)
 
     async def test_autofix_triggers_provider_for_unresolved_review_comments(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

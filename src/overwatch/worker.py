@@ -35,6 +35,8 @@ async def run_once(
             continue
         review_threads = _review_threads_for_work(github, pr, watched)
         if watched.merge_on_bot_approval and status.state == "success":
+            if review_threads is None:
+                continue
             if review_threads:
                 attempt_count = store.attempt_count(watched.id, status.head_sha)
                 if watched.autofix and attempt_count < max_attempts_per_sha:
@@ -46,7 +48,7 @@ async def run_once(
                         _review_summary(review_threads),
                     )
                     if completed:
-                        github.request_codex_review(pr)
+                        github.request_codex_review(pr, status.head_sha)
                 continue
             decision = github.get_codex_review_decision(pr, status.head_sha)
             if decision.approved:
@@ -60,10 +62,10 @@ async def run_once(
         if store.attempt_count(watched.id, status.head_sha) >= max_attempts_per_sha:
             continue
 
-        summary = _work_summary(status.summary, status.state, review_threads)
+        summary = _work_summary(status.summary, status.state, review_threads or [])
         completed = await _attempt_fix(store, registry, watched, status.head_sha, summary)
         if completed and watched.merge_on_bot_approval:
-            github.request_codex_review(pr)
+            github.request_codex_review(pr, status.head_sha)
 
 
 async def _attempt_fix(
@@ -99,14 +101,14 @@ def _review_threads_for_work(
     github: GitHubClient,
     pr: PullRequestRef,
     watched: WatchedPullRequest,
-) -> list[ReviewThread]:
+) -> list[ReviewThread] | None:
     if not watched.autofix and not watched.merge_on_bot_approval:
         return []
     try:
         return github.get_unresolved_review_threads(pr)
     except RuntimeError:
         if watched.merge_on_bot_approval:
-            raise
+            return None
         return []
 
 

@@ -108,7 +108,14 @@ class GitHubClient:
         comments = self._request_all_pages(
             f"/repos/{pr.owner}/{pr.repo}/issues/{pr.number}/comments"
         )
-        codex_items = _codex_review_items(reviews, comments, head_sha=head_sha)
+        head_created_at = self._commit_created_at(pr, head_sha) if head_sha else None
+        review_requested_at = _latest_codex_review_request_created_at(comments, head_sha)
+        codex_items = _codex_review_items(
+            reviews,
+            comments,
+            head_sha=head_sha,
+            min_comment_created_at=review_requested_at or head_created_at,
+        )
         if not codex_items:
             if head_sha:
                 return CodexReviewDecision(
@@ -135,12 +142,27 @@ class GitHubClient:
             data=data,
         )
 
-    def request_codex_review(self, pr: PullRequestRef) -> None:
+    def request_codex_review(self, pr: PullRequestRef, head_sha: str | None = None) -> None:
+        body = "@codex review"
+        if head_sha:
+            body = f"{body}\n\nHead SHA: {head_sha}"
         self._request(
             f"/repos/{pr.owner}/{pr.repo}/issues/{pr.number}/comments",
             method="POST",
-            data={"body": "@codex review"},
+            data={"body": body},
         )
+
+    def _commit_created_at(self, pr: PullRequestRef, head_sha: str) -> str:
+        commit = self._request(f"/repos/{pr.owner}/{pr.repo}/commits/{head_sha}")
+        if not isinstance(commit, dict):
+            raise RuntimeError("GitHub commit response was not an object")
+        data = commit.get("commit") or {}
+        if not isinstance(data, dict):
+            raise RuntimeError("GitHub commit response did not include commit data")
+        committer = data.get("committer") or {}
+        if not isinstance(committer, dict) or not committer.get("date"):
+            raise RuntimeError("GitHub commit response did not include committer date")
+        return str(committer["date"])
 
     def get_unresolved_review_threads(self, pr: PullRequestRef) -> list[ReviewThread]:
         threads: list[dict[str, Any]] = []
@@ -312,6 +334,7 @@ def _codex_review_items(
     comments: object,
     *,
     head_sha: str | None = None,
+    min_comment_created_at: str | None = None,
 ) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     for review in reviews if isinstance(reviews, list) else []:
@@ -325,7 +348,11 @@ def _codex_review_items(
                 }
             )
     for comment in comments if isinstance(comments, list) else []:
-        if _is_codex_authored(comment) and head_sha is None:
+        if _is_codex_authored(comment) and _comment_matches_head_window(
+            comment,
+            head_sha,
+            min_comment_created_at,
+        ):
             items.append(
                 {
                     "body": comment.get("body"),
@@ -334,6 +361,34 @@ def _codex_review_items(
                 }
             )
     return sorted(items, key=lambda item: str(item["created_at"]))
+
+
+def _latest_codex_review_request_created_at(comments: object, head_sha: str | None) -> str | None:
+    if head_sha is None:
+        return None
+    timestamps: list[str] = []
+    for comment in comments if isinstance(comments, list) else []:
+        if not isinstance(comment, dict):
+            continue
+        body = str(comment.get("body") or "").lower()
+        if "@codex review" not in body or head_sha.lower() not in body:
+            continue
+        created_at = str(comment.get("created_at") or "")
+        if created_at:
+            timestamps.append(created_at)
+    return max(timestamps, default=None)
+
+
+def _comment_matches_head_window(
+    item: dict[str, Any],
+    head_sha: str | None,
+    min_created_at: str | None,
+) -> bool:
+    if head_sha is None:
+        return True
+    if min_created_at is None:
+        return False
+    return str(item.get("created_at") or "") >= min_created_at
 
 
 def _matches_head(item: dict[str, Any], head_sha: str | None) -> bool:
