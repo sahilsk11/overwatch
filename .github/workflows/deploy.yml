@@ -1,0 +1,46 @@
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: overwatch-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout sas (for ansible playbook)
+        uses: actions/checkout@v4
+        with:
+          repository: sahilsk11/sas
+          ref: main
+          ssh-key: ${{ secrets.SAS_REPO_DEPLOY_KEY }}
+
+      - name: install ansible
+        run: |
+          pip install --upgrade pip
+          pip install "ansible-core>=2.16"
+
+      - name: install collections
+        run: ansible-galaxy collection install -r ansible/requirements.yml
+
+      - name: write SSH key
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "${{ secrets.SAS_SSH_KEY_RSA }}" > ~/.ssh/sas
+          chmod 600 ~/.ssh/sas
+          ssh-keyscan -H 178.105.41.104 >> ~/.ssh/known_hosts
+
+      - name: run overwatch playbook role
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN_FOR_OVERLORD }}
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          ansible-playbook ansible/playbook.yml -i ansible/inventory.yml \
+            -e "ansible_ssh_private_key_file=~/.ssh/sas" \
+            --tags overwatch
