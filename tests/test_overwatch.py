@@ -37,16 +37,23 @@ class FakeGitHubClient:
         self.review_threads_error = review_threads_error
         self.checked: list[PullRequestRef] = []
         self.reviewed: list[PullRequestRef] = []
+        self.review_head_shas: list[str | None] = []
         self.thread_checked: list[PullRequestRef] = []
         self.merged: list[PullRequestRef] = []
+        self.merge_head_shas: list[str | None] = []
         self.review_requests: list[PullRequestRef] = []
 
     def get_ci_status(self, pr: PullRequestRef) -> CiStatus:
         self.checked.append(pr)
         return self.status
 
-    def get_codex_review_decision(self, pr: PullRequestRef) -> CodexReviewDecision:
+    def get_codex_review_decision(
+        self,
+        pr: PullRequestRef,
+        head_sha: str | None = None,
+    ) -> CodexReviewDecision:
         self.reviewed.append(pr)
+        self.review_head_shas.append(head_sha)
         return self.decision
 
     def get_unresolved_review_threads(self, pr: PullRequestRef) -> list[ReviewThread]:
@@ -55,8 +62,9 @@ class FakeGitHubClient:
             raise self.review_threads_error
         return self.review_threads
 
-    def merge_pr(self, pr: PullRequestRef) -> None:
+    def merge_pr(self, pr: PullRequestRef, head_sha: str | None = None) -> None:
         self.merged.append(pr)
+        self.merge_head_shas.append(head_sha)
 
     def request_codex_review(self, pr: PullRequestRef) -> None:
         self.review_requests.append(pr)
@@ -203,6 +211,106 @@ class GitHubClientTest(unittest.TestCase):
         self.assertEqual(client._request_all_pages("/first"), [{"id": 1}, {"id": 2}])
         self.assertEqual(client.calls, ["/first", "https://api.github.test/second"])
 
+    def test_get_unresolved_review_threads_follows_graphql_pages(self) -> None:
+        class ThreadPagingClient(GitHubClient):
+            def __init__(self) -> None:
+                super().__init__(token="token", api_url="https://api.github.test")
+                self.cursors: list[str | None] = []
+
+            def _graphql(self, query: str, variables: dict[str, object]) -> dict[str, object]:
+                self.cursors.append(variables.get("cursor"))
+                if variables.get("cursor") is None:
+                    return {
+                        "repository": {
+                            "pullRequest": {
+                                "reviewThreads": {
+                                    "pageInfo": {"hasNextPage": True, "endCursor": "CURSOR2"},
+                                    "nodes": [
+                                        {
+                                            "id": "THREAD1",
+                                            "isResolved": True,
+                                            "comments": {"nodes": []},
+                                        }
+                                    ],
+                                }
+                            }
+                        }
+                    }
+                return {
+                    "repository": {
+                        "pullRequest": {
+                            "reviewThreads": {
+                                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                                "nodes": [
+                                    {
+                                        "id": "THREAD2",
+                                        "isResolved": False,
+                                        "path": "src/example.py",
+                                        "line": 12,
+                                        "comments": {
+                                            "nodes": [
+                                                {
+                                                    "author": {"login": "codex"},
+                                                    "body": "Please fix this.",
+                                                    "url": "https://example.test/thread2",
+                                                    "createdAt": "2026-05-15T00:01:00Z",
+                                                }
+                                            ]
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    }
+                }
+
+        client = ThreadPagingClient()
+        threads = client.get_unresolved_review_threads(
+            PullRequestRef("example", "repo", 42, "https://github.com/example/repo/pull/42")
+        )
+
+        self.assertEqual(client.cursors, [None, "CURSOR2"])
+        self.assertEqual(len(threads), 1)
+        self.assertEqual(threads[0].id, "THREAD2")
+
+    def test_codex_review_decision_requires_current_head_review(self) -> None:
+        class ReviewClient(GitHubClient):
+            def _request_all_pages(self, path: str) -> list[dict[str, object]]:
+                if path.endswith("/reviews"):
+                    return [
+                        {
+                            "user": {"login": "codex"},
+                            "state": "APPROVED",
+                            "commit_id": "old-sha",
+                            "body": "Looks good",
+                            "submitted_at": "2026-05-15T00:00:00Z",
+                        },
+                        {
+                            "user": {"login": "codex"},
+                            "state": "COMMENTED",
+                            "commit_id": "current-sha",
+                            "body": "Please fix this.",
+                            "submitted_at": "2026-05-15T00:01:00Z",
+                        },
+                    ]
+                return [
+                    {
+                        "user": {"login": "codex"},
+                        "body": "Codex review: didn't find any major issues.",
+                        "created_at": "2026-05-15T00:02:00Z",
+                    }
+                ]
+
+        client = ReviewClient(token="token")
+
+        decision = client.get_codex_review_decision(
+            PullRequestRef("example", "repo", 42, "https://github.com/example/repo/pull/42"),
+            "current-sha",
+        )
+
+        self.assertFalse(decision.approved)
+        self.assertEqual(decision.summary, "Please fix this.")
+
     def test_codex_author_requires_trusted_login(self) -> None:
         self.assertTrue(_is_codex_authored({"user": {"login": "codex"}}))
         self.assertTrue(_is_codex_authored({"user": {"login": "chatgpt-codex-connector"}}))
@@ -326,7 +434,9 @@ class WorkerTest(unittest.IsolatedAsyncioTestCase):
             await run_once(store, github=github, registry=ProviderRegistry([FakeProvider()]))
 
             self.assertEqual(len(github.reviewed), 1)
+            self.assertEqual(github.review_head_shas, ["abc123"])
             self.assertEqual(len(github.merged), 1)
+            self.assertEqual(github.merge_head_shas, ["abc123"])
             self.assertEqual(store.watched_prs(), [])
             self.assertEqual(store.watched_prs(include_inactive=True)[0].status, "merged")
 

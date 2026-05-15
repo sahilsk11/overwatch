@@ -99,13 +99,22 @@ class GitHubClient:
             merged=bool(pull.get("merged")),
         )
 
-    def get_codex_review_decision(self, pr: PullRequestRef) -> CodexReviewDecision:
+    def get_codex_review_decision(
+        self,
+        pr: PullRequestRef,
+        head_sha: str | None = None,
+    ) -> CodexReviewDecision:
         reviews = self._request_all_pages(f"/repos/{pr.owner}/{pr.repo}/pulls/{pr.number}/reviews")
         comments = self._request_all_pages(
             f"/repos/{pr.owner}/{pr.repo}/issues/{pr.number}/comments"
         )
-        codex_items = _codex_review_items(reviews, comments)
+        codex_items = _codex_review_items(reviews, comments, head_sha=head_sha)
         if not codex_items:
+            if head_sha:
+                return CodexReviewDecision(
+                    approved=False,
+                    summary="No Codex review comments found for the current head.",
+                )
             return CodexReviewDecision(approved=False, summary="No Codex review comments found.")
 
         latest = codex_items[-1]
@@ -118,8 +127,13 @@ class GitHubClient:
             summary=body or "Latest Codex review is not approval.",
         )
 
-    def merge_pr(self, pr: PullRequestRef) -> None:
-        self._request(f"/repos/{pr.owner}/{pr.repo}/pulls/{pr.number}/merge", method="PUT", data={})
+    def merge_pr(self, pr: PullRequestRef, head_sha: str | None = None) -> None:
+        data = {"sha": head_sha} if head_sha else {}
+        self._request(
+            f"/repos/{pr.owner}/{pr.repo}/pulls/{pr.number}/merge",
+            method="PUT",
+            data=data,
+        )
 
     def request_codex_review(self, pr: PullRequestRef) -> None:
         self._request(
@@ -129,12 +143,19 @@ class GitHubClient:
         )
 
     def get_unresolved_review_threads(self, pr: PullRequestRef) -> list[ReviewThread]:
-        data = self._graphql(
-            """
-            query($owner: String!, $repo: String!, $number: Int!) {
+        threads: list[dict[str, Any]] = []
+        cursor: str | None = None
+        while True:
+            data = self._graphql(
+                """
+            query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
               repository(owner: $owner, name: $repo) {
                 pullRequest(number: $number) {
-                  reviewThreads(first: 100) {
+                  reviewThreads(first: 100, after: $cursor) {
+                    pageInfo {
+                      hasNextPage
+                      endCursor
+                    }
                     nodes {
                       id
                       isResolved
@@ -155,14 +176,24 @@ class GitHubClient:
               }
             }
             """,
-            {"owner": pr.owner, "repo": pr.repo, "number": pr.number},
-        )
-        threads = (
-            data.get("repository", {})
-            .get("pullRequest", {})
-            .get("reviewThreads", {})
-            .get("nodes", [])
-        )
+                {"owner": pr.owner, "repo": pr.repo, "number": pr.number, "cursor": cursor},
+            )
+            review_threads = (
+                data.get("repository", {})
+                .get("pullRequest", {})
+                .get("reviewThreads", {})
+            )
+            if not isinstance(review_threads, dict):
+                raise RuntimeError("GitHub GraphQL response did not include reviewThreads")
+            nodes = review_threads.get("nodes") or []
+            if isinstance(nodes, list):
+                threads.extend(node for node in nodes if isinstance(node, dict))
+            page_info = review_threads.get("pageInfo") or {}
+            if not isinstance(page_info, dict) or not page_info.get("hasNextPage"):
+                break
+            cursor = str(page_info.get("endCursor") or "")
+            if not cursor:
+                raise RuntimeError("GitHub GraphQL reviewThreads page did not include endCursor")
         return _unresolved_review_threads(threads)
 
     def _request(
@@ -276,19 +307,25 @@ def _unresolved_review_threads(threads: object) -> list[ReviewThread]:
     return unresolved
 
 
-def _codex_review_items(reviews: object, comments: object) -> list[dict[str, Any]]:
+def _codex_review_items(
+    reviews: object,
+    comments: object,
+    *,
+    head_sha: str | None = None,
+) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     for review in reviews if isinstance(reviews, list) else []:
-        if _is_codex_authored(review):
+        if _is_codex_authored(review) and _matches_head(review, head_sha):
             items.append(
                 {
                     "body": review.get("body"),
                     "state": review.get("state"),
+                    "commit_id": review.get("commit_id"),
                     "created_at": review.get("submitted_at") or review.get("created_at") or "",
                 }
             )
     for comment in comments if isinstance(comments, list) else []:
-        if _is_codex_authored(comment):
+        if _is_codex_authored(comment) and head_sha is None:
             items.append(
                 {
                     "body": comment.get("body"),
@@ -297,6 +334,12 @@ def _codex_review_items(reviews: object, comments: object) -> list[dict[str, Any
                 }
             )
     return sorted(items, key=lambda item: str(item["created_at"]))
+
+
+def _matches_head(item: dict[str, Any], head_sha: str | None) -> bool:
+    if head_sha is None:
+        return True
+    return item.get("commit_id") == head_sha
 
 
 def _is_codex_authored(item: dict[str, Any]) -> bool:

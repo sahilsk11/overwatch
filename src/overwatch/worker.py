@@ -48,9 +48,9 @@ async def run_once(
                     if completed:
                         github.request_codex_review(pr)
                 continue
-            decision = github.get_codex_review_decision(pr)
+            decision = github.get_codex_review_decision(pr, status.head_sha)
             if decision.approved:
-                github.merge_pr(pr)
+                github.merge_pr(pr, status.head_sha)
                 store.mark_inactive(watched.id, status="merged")
             continue
         if not watched.autofix:
