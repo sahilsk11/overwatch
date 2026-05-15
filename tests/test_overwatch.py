@@ -26,12 +26,16 @@ class FakeGitHubClient:
         self,
         status: CiStatus,
         decision: CodexReviewDecision | None = None,
+        review_threads: list[ReviewThread] | None = None,
     ) -> None:
         self.status = status
         self.decision = decision or CodexReviewDecision(approved=False, summary="No approval")
+        self.review_threads = review_threads or []
         self.checked: list[PullRequestRef] = []
         self.reviewed: list[PullRequestRef] = []
+        self.thread_checked: list[PullRequestRef] = []
         self.merged: list[PullRequestRef] = []
+        self.review_requests: list[PullRequestRef] = []
 
     def get_ci_status(self, pr: PullRequestRef) -> CiStatus:
         self.checked.append(pr)
@@ -41,8 +45,15 @@ class FakeGitHubClient:
         self.reviewed.append(pr)
         return self.decision
 
+    def get_unresolved_review_threads(self, pr: PullRequestRef) -> list[ReviewThread]:
+        self.thread_checked.append(pr)
+        return self.review_threads
+
     def merge_pr(self, pr: PullRequestRef) -> None:
         self.merged.append(pr)
+
+    def request_codex_review(self, pr: PullRequestRef) -> None:
+        self.review_requests.append(pr)
 
 
 class FakeProvider:
@@ -117,6 +128,7 @@ class CiStatusTest(unittest.TestCase):
         threads = _unresolved_review_threads(
             [
                 {
+                    "id": "THREAD1",
                     "isResolved": True,
                     "path": "src/example.py",
                     "line": 10,
@@ -132,6 +144,7 @@ class CiStatusTest(unittest.TestCase):
                     },
                 },
                 {
+                    "id": "THREAD2",
                     "isResolved": False,
                     "path": "src/example.py",
                     "line": 12,
@@ -150,6 +163,7 @@ class CiStatusTest(unittest.TestCase):
         )
 
         self.assertEqual(len(threads), 1)
+        self.assertEqual(threads[0].id, "THREAD2")
         self.assertEqual(threads[0].author, "codex")
         self.assertEqual(threads[0].body, "Please remove this smoke test.")
 
@@ -158,6 +172,7 @@ class CliTest(unittest.TestCase):
     def test_format_review_thread_includes_location_author_and_url(self) -> None:
         line = _format_review_thread(
             ReviewThread(
+                id="THREAD2",
                 author="codex",
                 body="Please remove this smoke test.",
                 url="https://github.com/example/repo/pull/1#discussion_r2",
@@ -296,6 +311,69 @@ class WorkerTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(github.merged), 0)
             self.assertEqual(store.watched_prs()[0].status, "unresolved")
 
+    async def test_autofix_triggers_provider_for_unresolved_review_comments(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = Store(Path(tmpdir) / "overwatch.sqlite3")
+            pr = parse_pr_url("https://github.com/example/repo/pull/42")
+            store.watch_pr(
+                pr,
+                provider="opencode",
+                model=None,
+                harness=None,
+                autofix=True,
+                merge_on_bot_approval=True,
+            )
+            github = FakeGitHubClient(
+                CiStatus(state="success", head_sha="abc123", summary="tests passed", details={}),
+                review_threads=[
+                    ReviewThread(
+                        id="THREAD2",
+                        author="codex",
+                        body="Please remove this smoke test.",
+                        url="https://github.com/example/repo/pull/42#discussion_r2",
+                        path="src/example.py",
+                        line=12,
+                        created_at="2026-05-15T00:01:00Z",
+                    )
+                ],
+            )
+            provider = FakeProvider()
+
+            await run_once(store, github=github, registry=ProviderRegistry([provider]))
+
+            self.assertEqual(len(provider.calls), 1)
+            prompt, _config = provider.calls[0]
+            self.assertIn("Please remove this smoke test.", prompt)
+            self.assertIn("reply on the thread", prompt)
+            self.assertIn("Resolve the review thread", prompt)
+            self.assertEqual(len(github.review_requests), 1)
+
+    async def test_review_comments_do_not_autofix_without_option(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = Store(Path(tmpdir) / "overwatch.sqlite3")
+            pr = parse_pr_url("https://github.com/example/repo/pull/42")
+            store.watch_pr(pr, provider="opencode", model=None, harness=None)
+            github = FakeGitHubClient(
+                CiStatus(state="success", head_sha="abc123", summary="tests passed", details={}),
+                review_threads=[
+                    ReviewThread(
+                        id="THREAD2",
+                        author="codex",
+                        body="Please remove this smoke test.",
+                        url="https://github.com/example/repo/pull/42#discussion_r2",
+                        path="src/example.py",
+                        line=12,
+                        created_at="2026-05-15T00:01:00Z",
+                    )
+                ],
+            )
+            provider = FakeProvider()
+
+            await run_once(store, github=github, registry=ProviderRegistry([provider]))
+
+            self.assertEqual(len(provider.calls), 0)
+            self.assertEqual(len(github.review_requests), 0)
+
     async def test_merged_pr_is_hidden_from_default_list(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = Store(Path(tmpdir) / "overwatch.sqlite3")
@@ -320,7 +398,13 @@ class WorkerTest(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             store = Store(Path(tmpdir) / "overwatch.sqlite3")
             pr = parse_pr_url("https://github.com/example/repo/pull/42")
-            store.watch_pr(pr, provider="opencode", model="gpt-5.5", harness="full")
+            store.watch_pr(
+                pr,
+                provider="opencode",
+                model="gpt-5.5",
+                harness="full",
+                autofix=True,
+            )
             github = FakeGitHubClient(
                 CiStatus(state="failure", head_sha="abc123", summary="tests failed", details={})
             )

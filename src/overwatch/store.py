@@ -26,6 +26,7 @@ class WatchedPullRequest:
     provider: str
     model: str | None
     harness: str | None
+    autofix: bool
     merge_on_bot_approval: bool
     created_at: str
     updated_at: str
@@ -42,6 +43,7 @@ class WatchedPullRequestSummary:
     provider: str
     model: str | None
     harness: str | None
+    autofix: bool
     merge_on_bot_approval: bool
     latest_ci_state: str | None
     latest_head_sha: str | None
@@ -107,6 +109,7 @@ class Store:
                 "merge_on_bot_approval",
                 "integer not null default 0",
             )
+            _ensure_column(conn, "watched_prs", "autofix", "integer not null default 0")
 
     def watch_pr(
         self,
@@ -115,6 +118,7 @@ class Store:
         provider: str,
         model: str | None,
         harness: str | None,
+        autofix: bool = False,
         merge_on_bot_approval: bool = False,
     ) -> WatchedPullRequest:
         self.init()
@@ -124,13 +128,14 @@ class Store:
                 """
                 insert into watched_prs
                     (url, owner, repo, number, provider, model, harness,
-                     merge_on_bot_approval, created_at, updated_at)
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     autofix, merge_on_bot_approval, created_at, updated_at)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 on conflict(url) do update set
                     status = 'unresolved',
                     provider = excluded.provider,
                     model = excluded.model,
                     harness = excluded.harness,
+                    autofix = excluded.autofix,
                     merge_on_bot_approval = excluded.merge_on_bot_approval,
                     updated_at = excluded.updated_at
                 """,
@@ -142,6 +147,7 @@ class Store:
                     provider,
                     model,
                     harness,
+                    int(autofix),
                     int(merge_on_bot_approval),
                     now,
                     now,
@@ -175,6 +181,7 @@ class Store:
                     watched_prs.provider,
                     watched_prs.model,
                     watched_prs.harness,
+                    watched_prs.autofix,
                     watched_prs.merge_on_bot_approval,
                     latest.state as latest_ci_state,
                     latest.head_sha as latest_head_sha,
@@ -265,12 +272,14 @@ class Store:
 
 def _watched_pr(row: sqlite3.Row) -> WatchedPullRequest:
     values = {key: row[key] for key in row.keys()}
+    values["autofix"] = bool(values["autofix"])
     values["merge_on_bot_approval"] = bool(values["merge_on_bot_approval"])
     return WatchedPullRequest(**values)
 
 
 def _watched_pr_summary(row: sqlite3.Row) -> WatchedPullRequestSummary:
     values = {key: row[key] for key in row.keys()}
+    values["autofix"] = bool(values["autofix"])
     values["merge_on_bot_approval"] = bool(values["merge_on_bot_approval"])
     return WatchedPullRequestSummary(**values)
 

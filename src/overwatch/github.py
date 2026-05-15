@@ -35,6 +35,7 @@ class CodexReviewDecision:
 
 @dataclass(frozen=True, slots=True)
 class ReviewThread:
+    id: str
     author: str
     body: str
     url: str
@@ -114,6 +115,13 @@ class GitHubClient:
     def merge_pr(self, pr: PullRequestRef) -> None:
         self._request(f"/repos/{pr.owner}/{pr.repo}/pulls/{pr.number}/merge", method="PUT", data={})
 
+    def request_codex_review(self, pr: PullRequestRef) -> None:
+        self._request(
+            f"/repos/{pr.owner}/{pr.repo}/issues/{pr.number}/comments",
+            method="POST",
+            data={"body": "@codex review"},
+        )
+
     def get_unresolved_review_threads(self, pr: PullRequestRef) -> list[ReviewThread]:
         data = self._graphql(
             """
@@ -122,6 +130,7 @@ class GitHubClient:
                 pullRequest(number: $number) {
                   reviewThreads(first: 100) {
                     nodes {
+                      id
                       isResolved
                       isOutdated
                       path
@@ -211,6 +220,7 @@ def _unresolved_review_threads(threads: object) -> list[ReviewThread]:
         author = comment.get("author") or {}
         unresolved.append(
             ReviewThread(
+                id=str(thread.get("id") or ""),
                 author=str(author.get("login") or "unknown"),
                 body=str(comment.get("body") or ""),
                 url=str(comment.get("url") or ""),

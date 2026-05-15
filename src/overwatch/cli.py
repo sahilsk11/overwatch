@@ -22,6 +22,11 @@ def main() -> None:
     parser.add_argument("--model", help="Model to pass to the coding agent")
     parser.add_argument("--harness", help="Harness name to pass to the coding agent")
     parser.add_argument(
+        "--autofix",
+        action="store_true",
+        help="Run the configured coding agent for failing CI or unresolved review comments",
+    )
+    parser.add_argument(
         "--merge-on-bot-approval",
         action="store_true",
         help="Merge after CI passes if the latest supported bot review approves the PR",
@@ -52,6 +57,7 @@ def main() -> None:
         provider=args.provider,
         model=args.model,
         harness=args.harness,
+        autofix=args.autofix,
         merge_on_bot_approval=args.merge_on_bot_approval,
     )
     print(f"watching {watched.url} with {watched.provider}")
