@@ -23,6 +23,8 @@ class CiStatus:
     head_sha: str
     summary: str
     details: dict[str, Any]
+    pr_state: str = "open"
+    merged: bool = False
 
 
 def parse_pr_url(url: str) -> PullRequestRef:
@@ -49,7 +51,7 @@ class GitHubClient:
         *,
         api_url: str = "https://api.github.com",
     ) -> None:
-        self._token = token or os.environ.get("GITHUB_TOKEN")
+        self._token = token or os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
         self._api_url = api_url.rstrip("/")
 
     def get_ci_status(self, pr: PullRequestRef) -> CiStatus:
@@ -57,15 +59,23 @@ class GitHubClient:
         head_sha = str(pull["head"]["sha"])
 
         combined = self._request(f"/repos/{pr.owner}/{pr.repo}/commits/{head_sha}/status")
-        checks = self._request(f"/repos/{pr.owner}/{pr.repo}/commits/{head_sha}/check-runs")
+        checks = self._request_optional(
+            f"/repos/{pr.owner}/{pr.repo}/commits/{head_sha}/check-runs"
+        )
+        actions = self._request_optional(
+            f"/repos/{pr.owner}/{pr.repo}/actions/runs?"
+            f"{urllib.parse.urlencode({'head_sha': head_sha})}"
+        )
 
-        state = _rollup_state(combined, checks)
-        summary = _summarize_status(combined, checks)
+        state = _rollup_state(combined, checks, actions)
+        summary = _summarize_status(combined, checks, actions)
         return CiStatus(
             state=state,
             head_sha=head_sha,
             summary=summary,
-            details={"combined_status": combined, "check_runs": checks},
+            details={"combined_status": combined, "check_runs": checks, "actions": actions},
+            pr_state=str(pull.get("state", "open")),
+            merged=bool(pull.get("merged")),
         )
 
     def _request(self, path: str) -> dict[str, Any]:
@@ -83,24 +93,46 @@ class GitHubClient:
             body = exc.read().decode("utf-8", errors="replace")
             raise RuntimeError(f"GitHub API error {exc.code} for {path}: {body}") from exc
 
+    def _request_optional(self, path: str) -> dict[str, Any]:
+        try:
+            return self._request(path)
+        except RuntimeError as exc:
+            return {"error": str(exc)}
 
-def _rollup_state(combined: dict[str, Any], checks: dict[str, Any]) -> str:
+
+def _rollup_state(
+    combined: dict[str, Any],
+    checks: dict[str, Any],
+    actions: dict[str, Any],
+) -> str:
     check_runs = checks.get("check_runs") or []
     conclusions = {run.get("conclusion") for run in check_runs if run.get("status") == "completed"}
     in_progress = any(run.get("status") != "completed" for run in check_runs)
+    workflow_runs = actions.get("workflow_runs") or []
+    workflow_conclusions = {
+        run.get("conclusion") for run in workflow_runs if run.get("status") == "completed"
+    }
+    workflows_in_progress = any(run.get("status") != "completed" for run in workflow_runs)
+    statuses = combined.get("statuses") or []
+    legacy_status_pending = bool(statuses) and combined.get("state") == "pending"
 
-    if conclusions & {"failure", "cancelled", "timed_out", "action_required"}:
+    failing_conclusions = {"failure", "cancelled", "timed_out", "action_required"}
+    if (conclusions | workflow_conclusions) & failing_conclusions:
         return "failure"
     if combined.get("state") in {"failure", "error"}:
         return "failure"
-    if in_progress or combined.get("state") == "pending":
+    if in_progress or workflows_in_progress or legacy_status_pending:
         return "pending"
-    if check_runs or combined.get("statuses"):
+    if check_runs or workflow_runs or statuses:
         return "success"
     return "unknown"
 
 
-def _summarize_status(combined: dict[str, Any], checks: dict[str, Any]) -> str:
+def _summarize_status(
+    combined: dict[str, Any],
+    checks: dict[str, Any],
+    actions: dict[str, Any],
+) -> str:
     lines: list[str] = []
     for status in combined.get("statuses") or []:
         state = status.get("state", "unknown")
@@ -112,4 +144,10 @@ def _summarize_status(combined: dict[str, Any], checks: dict[str, Any]) -> str:
         status = run.get("status", "unknown")
         conclusion = run.get("conclusion") or ""
         lines.append(f"check {name}: {status} {conclusion}".strip())
+    for run in actions.get("workflow_runs") or []:
+        name = run.get("name", "workflow")
+        status = run.get("status", "unknown")
+        conclusion = run.get("conclusion") or ""
+        url = run.get("html_url") or ""
+        lines.append(f"workflow {name}: {status} {conclusion} {url}".strip())
     return "\n".join(lines) if lines else "No CI checks reported."

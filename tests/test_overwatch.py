@@ -4,7 +4,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from overwatch.github import CiStatus, PullRequestRef, parse_pr_url
+from overwatch.github import (
+    CiStatus,
+    PullRequestRef,
+    _rollup_state,
+    _summarize_status,
+    parse_pr_url,
+)
 from overwatch.providers import AgentConfig, ProviderRegistry
 from overwatch.store import Store
 from overwatch.worker import run_once
@@ -43,6 +49,42 @@ class ParsePrUrlTest(unittest.TestCase):
             parse_pr_url("https://github.com/example/repo/issues/42")
 
 
+class CiStatusTest(unittest.TestCase):
+    def test_actions_failure_marks_ci_failed(self) -> None:
+        combined = {"state": "pending", "statuses": []}
+        checks = {"error": "check-runs unavailable"}
+        actions = {
+            "workflow_runs": [
+                {
+                    "name": "CI",
+                    "status": "completed",
+                    "conclusion": "failure",
+                    "html_url": "https://github.com/example/repo/actions/runs/1",
+                }
+            ]
+        }
+
+        self.assertEqual(_rollup_state(combined, checks, actions), "failure")
+        summary = _summarize_status(combined, checks, actions)
+
+        self.assertIn("workflow CI: completed failure", summary)
+
+    def test_actions_success_ignores_empty_legacy_status_pending(self) -> None:
+        combined = {"state": "pending", "statuses": []}
+        checks = {"error": "check-runs unavailable"}
+        actions = {
+            "workflow_runs": [
+                {
+                    "name": "CI",
+                    "status": "completed",
+                    "conclusion": "success",
+                }
+            ]
+        }
+
+        self.assertEqual(_rollup_state(combined, checks, actions), "success")
+
+
 class StoreTest(unittest.TestCase):
     def test_watch_pr_upserts_provider_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -57,8 +99,80 @@ class StoreTest(unittest.TestCase):
             self.assertEqual(watched.harness, "full")
             self.assertEqual(len(store.unresolved_prs()), 1)
 
+    def test_watched_prs_includes_latest_ci_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = Store(Path(tmpdir) / "overwatch.sqlite3")
+            pr = parse_pr_url("https://github.com/example/repo/pull/42")
+            watched = store.watch_pr(pr, provider="opencode", model=None, harness=None)
+            store.record_ci_status(
+                watched.id,
+                CiStatus(state="success", head_sha="abc123", summary="CI passed", details={}),
+            )
+
+            rows = store.watched_prs()
+
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0].latest_ci_state, "success")
+            self.assertEqual(rows[0].latest_head_sha, "abc123")
+
+    def test_watched_prs_hides_inactive_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = Store(Path(tmpdir) / "overwatch.sqlite3")
+            pr = parse_pr_url("https://github.com/example/repo/pull/42")
+            watched = store.watch_pr(pr, provider="opencode", model=None, harness=None)
+            store.mark_inactive(watched.id, status="merged")
+
+            self.assertEqual(store.watched_prs(), [])
+            self.assertEqual(store.watched_prs(include_inactive=True)[0].status, "merged")
+
+    def test_watched_prs_hides_legacy_resolved_rows_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = Store(Path(tmpdir) / "overwatch.sqlite3")
+            pr = parse_pr_url("https://github.com/example/repo/pull/42")
+            watched = store.watch_pr(pr, provider="opencode", model=None, harness=None)
+            store.mark_resolved(watched.id)
+
+            self.assertEqual(store.watched_prs(), [])
+            self.assertEqual(store.watched_prs(include_inactive=True)[0].status, "resolved")
+
 
 class WorkerTest(unittest.IsolatedAsyncioTestCase):
+    async def test_success_does_not_remove_open_pr_from_list(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = Store(Path(tmpdir) / "overwatch.sqlite3")
+            pr = parse_pr_url("https://github.com/example/repo/pull/42")
+            store.watch_pr(pr, provider="opencode", model=None, harness=None)
+            github = FakeGitHubClient(
+                CiStatus(state="success", head_sha="abc123", summary="tests passed", details={})
+            )
+
+            await run_once(store, github=github, registry=ProviderRegistry([FakeProvider()]))
+
+            rows = store.watched_prs()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0].status, "unresolved")
+            self.assertEqual(rows[0].latest_ci_state, "success")
+
+    async def test_merged_pr_is_hidden_from_default_list(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = Store(Path(tmpdir) / "overwatch.sqlite3")
+            pr = parse_pr_url("https://github.com/example/repo/pull/42")
+            store.watch_pr(pr, provider="opencode", model=None, harness=None)
+            github = FakeGitHubClient(
+                CiStatus(
+                    state="success",
+                    head_sha="abc123",
+                    summary="tests passed",
+                    details={},
+                    merged=True,
+                )
+            )
+
+            await run_once(store, github=github, registry=ProviderRegistry([FakeProvider()]))
+
+            self.assertEqual(store.watched_prs(), [])
+            self.assertEqual(store.watched_prs(include_inactive=True)[0].status, "merged")
+
     async def test_failure_triggers_provider_attempt(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = Store(Path(tmpdir) / "overwatch.sqlite3")

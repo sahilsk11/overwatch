@@ -27,8 +27,11 @@ async def run_once(
         status = github.get_ci_status(pr)
         store.record_ci_status(watched.id, status)
 
-        if status.state == "success":
-            store.mark_resolved(watched.id)
+        if status.merged:
+            store.mark_inactive(watched.id, status="merged")
+            continue
+        if status.pr_state == "closed":
+            store.mark_inactive(watched.id, status="closed")
             continue
         if status.state != "failure":
             continue
@@ -77,5 +80,6 @@ CI summary:
 {summary}
 
 Diagnose the failure, make the smallest correct code change, and run the relevant tests.
+If you are in the target repository on the PR branch, commit the fix and push it.
 Do not amend commits or force push.
 """
