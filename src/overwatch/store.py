@@ -30,6 +30,23 @@ class WatchedPullRequest:
     updated_at: str
 
 
+@dataclass(frozen=True, slots=True)
+class WatchedPullRequestSummary:
+    id: int
+    url: str
+    owner: str
+    repo: str
+    number: int
+    status: str
+    provider: str
+    model: str | None
+    harness: str | None
+    latest_ci_state: str | None
+    latest_head_sha: str | None
+    latest_summary: str | None
+    latest_checked_at: str | None
+
+
 class Store:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -119,6 +136,40 @@ class Store:
             ).fetchall()
         return [_watched_pr(row) for row in rows]
 
+    def watched_prs(self, *, include_inactive: bool = False) -> list[WatchedPullRequestSummary]:
+        self.init()
+        inactive_statuses = "'resolved', 'merged', 'closed'"
+        where = "" if include_inactive else f"where watched_prs.status not in ({inactive_statuses})"
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                select
+                    watched_prs.id,
+                    watched_prs.url,
+                    watched_prs.owner,
+                    watched_prs.repo,
+                    watched_prs.number,
+                    watched_prs.status,
+                    watched_prs.provider,
+                    watched_prs.model,
+                    watched_prs.harness,
+                    latest.state as latest_ci_state,
+                    latest.head_sha as latest_head_sha,
+                    latest.summary as latest_summary,
+                    latest.created_at as latest_checked_at
+                from watched_prs
+                left join ci_check_history latest
+                    on latest.id = (
+                        select max(id)
+                        from ci_check_history
+                        where watched_pr_id = watched_prs.id
+                    )
+                {where}
+                order by watched_prs.created_at
+                """
+            ).fetchall()
+        return [_watched_pr_summary(row) for row in rows]
+
     def record_ci_status(self, pr_id: int, status: CiStatus) -> None:
         with self.connect() as conn:
             conn.execute(
@@ -179,9 +230,22 @@ class Store:
                 (_now(), pr_id),
             )
 
+    def mark_inactive(self, pr_id: int, *, status: str) -> None:
+        if status not in {"merged", "closed"}:
+            raise ValueError("inactive status must be 'merged' or 'closed'")
+        with self.connect() as conn:
+            conn.execute(
+                "update watched_prs set status = ?, updated_at = ? where id = ?",
+                (status, _now(), pr_id),
+            )
+
 
 def _watched_pr(row: sqlite3.Row) -> WatchedPullRequest:
     return WatchedPullRequest(**{key: row[key] for key in row.keys()})
+
+
+def _watched_pr_summary(row: sqlite3.Row) -> WatchedPullRequestSummary:
+    return WatchedPullRequestSummary(**{key: row[key] for key in row.keys()})
 
 
 def _now() -> str:

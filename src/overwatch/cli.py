@@ -11,8 +11,9 @@ from overwatch.worker import run_forever, run_once
 
 def main() -> None:
     parser = argparse.ArgumentParser(prog="overwatch")
-    parser.add_argument("pr_link", nargs="?", help="GitHub PR URL to watch")
+    parser.add_argument("pr_link", nargs="?", help="GitHub PR URL to watch, or 'list'")
     parser.add_argument("--db", type=Path, default=default_db_path(), help="SQLite database path")
+    parser.add_argument("--all", action="store_true", help="Include merged and closed PRs in list")
     parser.add_argument(
         "--provider",
         default="opencode",
@@ -34,12 +35,31 @@ def main() -> None:
     if args.worker:
         run_forever(store, interval_seconds=args.interval)
         return
+    if args.pr_link == "list":
+        _print_watched_prs(store, include_inactive=args.all)
+        return
     if not args.pr_link:
-        parser.error("provide a GitHub PR URL, --run-once, or --worker")
+        parser.error("provide a GitHub PR URL, 'list', --run-once, or --worker")
 
     pr = parse_pr_url(args.pr_link)
     watched = store.watch_pr(pr, provider=args.provider, model=args.model, harness=args.harness)
     print(f"watching {watched.url} with {watched.provider}")
+
+
+def _print_watched_prs(store: Store, *, include_inactive: bool) -> None:
+    rows = store.watched_prs(include_inactive=include_inactive)
+    if not rows:
+        print("No watched PRs.")
+        return
+
+    print("STATUS   CI       PR  PROVIDER  MODEL  URL")
+    for row in rows:
+        ci_state = row.latest_ci_state or "unknown"
+        model = row.model or "-"
+        print(
+            f"{row.status:<8} {ci_state:<8} "
+            f"#{row.number:<3} {row.provider:<9} {model:<6} {row.url}"
+        )
 
 
 if __name__ == "__main__":
