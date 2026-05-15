@@ -108,13 +108,12 @@ class GitHubClient:
         comments = self._request_all_pages(
             f"/repos/{pr.owner}/{pr.repo}/issues/{pr.number}/comments"
         )
-        head_created_at = self._commit_created_at(pr, head_sha) if head_sha else None
         review_requested_at = _latest_codex_review_request_created_at(comments, head_sha)
         codex_items = _codex_review_items(
             reviews,
             comments,
             head_sha=head_sha,
-            min_comment_created_at=review_requested_at or head_created_at,
+            min_comment_created_at=review_requested_at,
         )
         if not codex_items:
             if head_sha:
@@ -151,18 +150,6 @@ class GitHubClient:
             method="POST",
             data={"body": body},
         )
-
-    def _commit_created_at(self, pr: PullRequestRef, head_sha: str) -> str:
-        commit = self._request(f"/repos/{pr.owner}/{pr.repo}/commits/{head_sha}")
-        if not isinstance(commit, dict):
-            raise RuntimeError("GitHub commit response was not an object")
-        data = commit.get("commit") or {}
-        if not isinstance(data, dict):
-            raise RuntimeError("GitHub commit response did not include commit data")
-        committer = data.get("committer") or {}
-        if not isinstance(committer, dict) or not committer.get("date"):
-            raise RuntimeError("GitHub commit response did not include committer date")
-        return str(committer["date"])
 
     def get_unresolved_review_threads(self, pr: PullRequestRef) -> list[ReviewThread]:
         threads: list[dict[str, Any]] = []

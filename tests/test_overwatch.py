@@ -275,17 +275,6 @@ class GitHubClientTest(unittest.TestCase):
 
     def test_codex_review_decision_requires_current_head_review(self) -> None:
         class ReviewClient(GitHubClient):
-            def _request(
-                self,
-                path: str,
-                *,
-                method: str = "GET",
-                data: dict[str, object] | None = None,
-            ) -> dict[str, object]:
-                if path != "/repos/example/repo/commits/current-sha":
-                    raise AssertionError(f"unexpected path: {path}")
-                return {"commit": {"committer": {"date": "2026-05-15T00:00:30Z"}}}
-
             def _request_all_pages(self, path: str) -> list[dict[str, object]]:
                 if path.endswith("/reviews"):
                     return [
@@ -324,17 +313,6 @@ class GitHubClientTest(unittest.TestCase):
 
     def test_codex_review_decision_accepts_current_head_issue_comment(self) -> None:
         class CommentClient(GitHubClient):
-            def _request(
-                self,
-                path: str,
-                *,
-                method: str = "GET",
-                data: dict[str, object] | None = None,
-            ) -> dict[str, object]:
-                if path != "/repos/example/repo/commits/current-sha":
-                    raise AssertionError(f"unexpected path: {path}")
-                return {"commit": {"committer": {"date": "2026-05-15T00:01:00Z"}}}
-
             def _request_all_pages(self, path: str) -> list[dict[str, object]]:
                 if path.endswith("/reviews"):
                     return []
@@ -359,6 +337,29 @@ class GitHubClientTest(unittest.TestCase):
         )
 
         self.assertTrue(decision.approved)
+
+    def test_codex_review_decision_ignores_unbound_issue_comment_for_head(self) -> None:
+        class CommentClient(GitHubClient):
+            def _request_all_pages(self, path: str) -> list[dict[str, object]]:
+                if path.endswith("/reviews"):
+                    return []
+                return [
+                    {
+                        "user": {"login": "codex"},
+                        "body": "Codex review: didn't find any major issues.",
+                        "created_at": "2026-05-15T00:02:00Z",
+                    }
+                ]
+
+        client = CommentClient(token="token")
+
+        decision = client.get_codex_review_decision(
+            PullRequestRef("example", "repo", 42, "https://github.com/example/repo/pull/42"),
+            "current-sha",
+        )
+
+        self.assertFalse(decision.approved)
+        self.assertEqual(decision.summary, "No Codex review comments found for the current head.")
 
     def test_codex_author_requires_trusted_login(self) -> None:
         self.assertTrue(_is_codex_authored({"user": {"login": "codex"}}))
