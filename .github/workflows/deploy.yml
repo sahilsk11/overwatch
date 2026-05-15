@@ -18,6 +18,7 @@ jobs:
         with:
           repository: sahilsk11/sas
           ref: main
+          ssh-key: ${{ secrets.SAS_REPO_DEPLOY_KEY }}
 
       - name: install ansible
         run: |
