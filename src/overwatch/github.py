@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -96,8 +97,8 @@ class GitHubClient:
         )
 
     def get_codex_review_decision(self, pr: PullRequestRef) -> CodexReviewDecision:
-        reviews = self._request(f"/repos/{pr.owner}/{pr.repo}/pulls/{pr.number}/reviews")
-        comments = self._request(f"/repos/{pr.owner}/{pr.repo}/issues/{pr.number}/comments")
+        reviews = self._request_all_pages(f"/repos/{pr.owner}/{pr.repo}/pulls/{pr.number}/reviews")
+        comments = self._request_all_pages(f"/repos/{pr.owner}/{pr.repo}/issues/{pr.number}/comments")
         codex_items = _codex_review_items(reviews, comments)
         if not codex_items:
             return CodexReviewDecision(approved=False, summary="No Codex review comments found.")
@@ -189,6 +190,34 @@ class GitHubClient:
         except RuntimeError as exc:
             return {"error": str(exc)}
 
+    def _request_all_pages(self, path: str) -> list[dict[str, Any]]:
+        results: list[dict[str, Any]] = []
+        next_path = path
+        while next_path:
+            response = self._request_raw(next_path)
+            if isinstance(response, list):
+                results.extend(response)
+            else:
+                results.append(response)
+            next_path = self._next_page_link(response)
+        return results
+
+    def _request_raw(self, path: str) -> dict[str, Any] | list[dict[str, Any]]:
+        return self._request(path)
+
+    def _next_page_link(self, response: dict[str, Any] | list[dict[str, Any]]) -> str | None:
+        if not isinstance(response, dict):
+            return None
+        link_header = response.get("link") or response.get("Link")
+        if not link_header:
+            return None
+        for part in link_header.split(","):
+            if 'rel="next"' in part:
+                match = re.search(r'<([^>]+)>', part)
+                if match:
+                    return match.group(1)
+        return None
+
     def _graphql(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
         response = self._request(
             "/graphql",
@@ -258,7 +287,7 @@ def _codex_review_items(reviews: object, comments: object) -> list[dict[str, Any
 def _is_codex_authored(item: dict[str, Any]) -> bool:
     user = item.get("user") or {}
     login = str(user.get("login") or "").lower()
-    return "codex" in login
+    return login == "codex"
 
 
 def _body_says_codex_approved(body: str) -> bool:
