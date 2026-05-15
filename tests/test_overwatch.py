@@ -69,6 +69,21 @@ class CiStatusTest(unittest.TestCase):
 
         self.assertIn("workflow CI: completed failure", summary)
 
+    def test_actions_success_ignores_empty_legacy_status_pending(self) -> None:
+        combined = {"state": "pending", "statuses": []}
+        checks = {"error": "check-runs unavailable"}
+        actions = {
+            "workflow_runs": [
+                {
+                    "name": "CI",
+                    "status": "completed",
+                    "conclusion": "success",
+                }
+            ]
+        }
+
+        self.assertEqual(_rollup_state(combined, checks, actions), "success")
+
 
 class StoreTest(unittest.TestCase):
     def test_watch_pr_upserts_provider_config(self) -> None:
