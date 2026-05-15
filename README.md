@@ -6,11 +6,14 @@ Overwatch watches GitHub pull requests, records CI state in SQLite, and invokes 
 
 ```sh
 overwatch https://github.com/OWNER/REPO/pull/123 --provider codex --model gpt-5.5
+overwatch https://github.com/OWNER/REPO/pull/123 --merge-on-bot-approval
 overwatch --run-once
 overwatch --worker --interval 300
 ```
 
 Set `GITHUB_TOKEN` for private repositories or higher API limits.
+
+`--merge-on-bot-approval` keeps watching the PR and, once CI is green, merges it if the latest supported bot review/comment approves it. Today that supports Codex-authored text saying Codex did not find any major issues. If the bot leaves actionable feedback instead, Overwatch leaves the PR open.
 
 ## Development
 

@@ -27,6 +27,12 @@ class CiStatus:
     merged: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class CodexReviewDecision:
+    approved: bool
+    summary: str
+
+
 def parse_pr_url(url: str) -> PullRequestRef:
     parsed = urllib.parse.urlparse(url)
     if parsed.netloc.lower() != "github.com":
@@ -78,11 +84,40 @@ class GitHubClient:
             merged=bool(pull.get("merged")),
         )
 
-    def _request(self, path: str) -> dict[str, Any]:
-        request = urllib.request.Request(self._api_url + path)
+    def get_codex_review_decision(self, pr: PullRequestRef) -> CodexReviewDecision:
+        reviews = self._request(f"/repos/{pr.owner}/{pr.repo}/pulls/{pr.number}/reviews")
+        comments = self._request(f"/repos/{pr.owner}/{pr.repo}/issues/{pr.number}/comments")
+        codex_items = _codex_review_items(reviews, comments)
+        if not codex_items:
+            return CodexReviewDecision(approved=False, summary="No Codex review comments found.")
+
+        latest = codex_items[-1]
+        state = str(latest.get("state") or "").upper()
+        body = str(latest.get("body") or "")
+        if state == "APPROVED" or _body_says_codex_approved(body):
+            return CodexReviewDecision(approved=True, summary=body or "Codex approved the PR.")
+        return CodexReviewDecision(
+            approved=False,
+            summary=body or "Latest Codex review is not approval.",
+        )
+
+    def merge_pr(self, pr: PullRequestRef) -> None:
+        self._request(f"/repos/{pr.owner}/{pr.repo}/pulls/{pr.number}/merge", method="PUT", data={})
+
+    def _request(
+        self,
+        path: str,
+        *,
+        method: str = "GET",
+        data: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | list[dict[str, Any]]:
+        body = json.dumps(data).encode("utf-8") if data is not None else None
+        request = urllib.request.Request(self._api_url + path, data=body, method=method)
         request.add_header("Accept", "application/vnd.github+json")
         request.add_header("User-Agent", "overwatch")
         request.add_header("X-GitHub-Api-Version", "2022-11-28")
+        if data is not None:
+            request.add_header("Content-Type", "application/json")
         if self._token:
             request.add_header("Authorization", f"Bearer {self._token}")
 
@@ -98,6 +133,53 @@ class GitHubClient:
             return self._request(path)
         except RuntimeError as exc:
             return {"error": str(exc)}
+
+
+def _codex_review_items(reviews: object, comments: object) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for review in reviews if isinstance(reviews, list) else []:
+        if _is_codex_authored(review):
+            items.append(
+                {
+                    "body": review.get("body"),
+                    "state": review.get("state"),
+                    "created_at": review.get("submitted_at") or review.get("created_at") or "",
+                }
+            )
+    for comment in comments if isinstance(comments, list) else []:
+        if _is_codex_authored(comment):
+            items.append(
+                {
+                    "body": comment.get("body"),
+                    "state": None,
+                    "created_at": comment.get("created_at") or "",
+                }
+            )
+    return sorted(items, key=lambda item: str(item["created_at"]))
+
+
+def _is_codex_authored(item: dict[str, Any]) -> bool:
+    user = item.get("user") or {}
+    login = str(user.get("login") or "").lower()
+    return "codex" in login
+
+
+def _body_says_codex_approved(body: str) -> bool:
+    text = " ".join(body.lower().split())
+    if not text:
+        return False
+    if "codex review" not in text and "codex" not in text:
+        return False
+    if "major issues" not in text:
+        return False
+    return any(
+        phrase in text
+        for phrase in (
+            "didn't find any major issues",
+            "did not find any major issues",
+            "no major issues",
+        )
+    )
 
 
 def _rollup_state(

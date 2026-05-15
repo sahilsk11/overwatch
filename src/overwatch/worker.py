@@ -33,6 +33,12 @@ async def run_once(
         if status.pr_state == "closed":
             store.mark_inactive(watched.id, status="closed")
             continue
+        if watched.merge_on_bot_approval and status.state == "success":
+            decision = github.get_codex_review_decision(pr)
+            if decision.approved:
+                github.merge_pr(pr)
+                store.mark_inactive(watched.id, status="merged")
+            continue
         if status.state != "failure":
             continue
         if store.attempt_count(watched.id, status.head_sha) >= max_attempts_per_sha:
