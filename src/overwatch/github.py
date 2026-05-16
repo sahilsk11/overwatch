@@ -351,19 +351,23 @@ def _codex_review_items(
 
 
 def _latest_codex_review_request_created_at(comments: object, head_sha: str | None) -> str | None:
-    if head_sha is None:
-        return None
-    timestamps: list[str] = []
+    head_timestamps: list[str] = []
+    fallback_timestamps: list[str] = []
     for comment in comments if isinstance(comments, list) else []:
         if not isinstance(comment, dict):
             continue
         body = str(comment.get("body") or "").lower()
-        if "@codex review" not in body or head_sha.lower() not in body:
+        if "@codex review" not in body:
             continue
         created_at = str(comment.get("created_at") or "")
-        if created_at:
-            timestamps.append(created_at)
-    return max(timestamps, default=None)
+        if not created_at:
+            continue
+        fallback_timestamps.append(created_at)
+        if head_sha is not None and head_sha.lower() in body:
+            head_timestamps.append(created_at)
+    if head_sha is not None:
+        return max(head_timestamps, default=None)
+    return max(fallback_timestamps, default=None)
 
 
 def _comment_matches_head_window(
@@ -386,7 +390,7 @@ def _matches_head(item: dict[str, Any], head_sha: str | None) -> bool:
 
 def _is_codex_authored(item: dict[str, Any]) -> bool:
     user = item.get("user") or {}
-    login = str(user.get("login") or "").lower()
+    login = str(user.get("login") or "").lower().removesuffix("[bot]")
     return login in TRUSTED_CODEX_LOGINS
 
 

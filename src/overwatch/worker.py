@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 
-from overwatch.github import GitHubClient, PullRequestRef, ReviewThread
+from overwatch.github import CiStatus, GitHubClient, PullRequestRef, ReviewThread
 from overwatch.providers import AgentConfig, ProviderRegistry, default_registry
 from overwatch.store import Store, WatchedPullRequest
 
@@ -34,7 +34,7 @@ async def run_once(
             store.mark_inactive(watched.id, status="closed")
             continue
         review_threads = _review_threads_for_work(github, pr, watched)
-        if watched.merge_on_bot_approval and status.state == "success":
+        if watched.merge_on_bot_approval and _ci_allows_bot_merge(status):
             if review_threads is None:
                 continue
             if review_threads:
@@ -132,6 +132,26 @@ def _work_summary(ci_summary: str, ci_state: str, review_threads: list[ReviewThr
     if review_threads:
         parts.append(_review_summary(review_threads))
     return "\n\n".join(parts)
+
+
+def _ci_allows_bot_merge(status: CiStatus) -> bool:
+    if status.state == "success":
+        return True
+    return status.state == "unknown" and _has_explicit_no_ci_checks(status)
+
+
+def _has_explicit_no_ci_checks(status: CiStatus) -> bool:
+    combined = status.details.get("combined_status")
+    checks = status.details.get("check_runs")
+    actions = status.details.get("actions")
+    ci_sources = (combined, checks, actions)
+    if not all(isinstance(item, dict) and "error" not in item for item in ci_sources):
+        return False
+    return not (
+        combined.get("statuses")
+        or checks.get("check_runs")
+        or actions.get("workflow_runs")
+    )
 
 
 def _build_prompt(watched: WatchedPullRequest, head_sha: str, summary: str) -> str:

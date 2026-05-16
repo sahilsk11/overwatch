@@ -10,7 +10,6 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from overwatch.api import create_app
-from overwatch.cli import _format_review_thread
 from overwatch.cli import _print_watched_prs
 from overwatch.github import (
     CiStatus,
@@ -345,12 +344,45 @@ class GitHubClientTest(unittest.TestCase):
 
         self.assertTrue(decision.approved)
 
+    def test_codex_review_decision_accepts_issue_comment_after_unbound_manual_request_without_head(
+        self,
+    ) -> None:
+        class CommentClient(GitHubClient):
+            def _request_all_pages(self, path: str) -> list[dict[str, object]]:
+                if path.endswith("/reviews"):
+                    return []
+                return [
+                    {
+                        "user": {"login": "sahilsk11"},
+                        "body": "@codex review",
+                        "created_at": "2026-05-15T00:01:30Z",
+                    },
+                    {
+                        "user": {"login": "chatgpt-codex-connector"},
+                        "body": "Codex Review: Didn't find any major issues. Keep it up!",
+                        "created_at": "2026-05-15T00:02:00Z",
+                    },
+                ]
+
+        client = CommentClient(token="token")
+
+        decision = client.get_codex_review_decision(
+            PullRequestRef("example", "repo", 42, "https://github.com/example/repo/pull/42")
+        )
+
+        self.assertTrue(decision.approved)
+
     def test_codex_review_decision_ignores_unbound_issue_comment_for_head(self) -> None:
         class CommentClient(GitHubClient):
             def _request_all_pages(self, path: str) -> list[dict[str, object]]:
                 if path.endswith("/reviews"):
                     return []
                 return [
+                    {
+                        "user": {"login": "sahilsk11"},
+                        "body": "@codex review",
+                        "created_at": "2026-05-15T00:01:30Z",
+                    },
                     {
                         "user": {"login": "codex"},
                         "body": "Codex review: didn't find any major issues.",
@@ -371,6 +403,7 @@ class GitHubClientTest(unittest.TestCase):
     def test_codex_author_requires_trusted_login(self) -> None:
         self.assertTrue(_is_codex_authored({"user": {"login": "codex"}}))
         self.assertTrue(_is_codex_authored({"user": {"login": "chatgpt-codex-connector"}}))
+        self.assertTrue(_is_codex_authored({"user": {"login": "chatgpt-codex-connector[bot]"}}))
         self.assertFalse(_is_codex_authored({"user": {"login": "alice-codex-fan"}}))
 
 
@@ -666,6 +699,69 @@ class WorkerTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(store.watched_prs(), [])
             self.assertEqual(store.watched_prs(include_inactive=True)[0].status, "merged")
 
+    async def test_no_ci_checks_merges_when_bot_approval_option_is_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = Store(Path(tmpdir) / "overwatch.sqlite3")
+            pr = parse_pr_url("https://github.com/example/repo/pull/42")
+            store.watch_pr(
+                pr,
+                provider="opencode",
+                model=None,
+                harness=None,
+                merge_on_bot_approval=True,
+            )
+            github = FakeGitHubClient(
+                CiStatus(
+                    state="unknown",
+                    head_sha="abc123",
+                    summary="No CI checks reported.",
+                    details={
+                        "combined_status": {"statuses": []},
+                        "check_runs": {"check_runs": []},
+                        "actions": {"workflow_runs": []},
+                    },
+                ),
+                CodexReviewDecision(approved=True, summary="Codex review: no major issues"),
+            )
+
+            await run_once(store, github=github, registry=ProviderRegistry([FakeProvider()]))
+
+            self.assertEqual(len(github.reviewed), 1)
+            self.assertEqual(len(github.merged), 1)
+            self.assertEqual(github.merge_head_shas, ["abc123"])
+            self.assertEqual(store.watched_prs(include_inactive=True)[0].status, "merged")
+
+    async def test_unknown_ci_with_missing_check_details_does_not_merge(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = Store(Path(tmpdir) / "overwatch.sqlite3")
+            pr = parse_pr_url("https://github.com/example/repo/pull/42")
+            store.watch_pr(
+                pr,
+                provider="opencode",
+                model=None,
+                harness=None,
+                merge_on_bot_approval=True,
+            )
+            github = FakeGitHubClient(
+                CiStatus(
+                    state="unknown",
+                    head_sha="abc123",
+                    summary="No CI checks reported.",
+                    details={
+                        "combined_status": {"statuses": []},
+                        "check_runs": {"error": "GitHub API error 403"},
+                        "actions": {"workflow_runs": []},
+                    },
+                ),
+                CodexReviewDecision(approved=True, summary="Codex review: no major issues"),
+            )
+
+            await run_once(store, github=github, registry=ProviderRegistry([FakeProvider()]))
+
+            self.assertEqual(len(github.reviewed), 0)
+            self.assertEqual(len(github.merged), 0)
+            self.assertEqual(store.watched_prs(include_inactive=True)[0].status, "unresolved")
+
     async def test_success_does_not_merge_without_bot_approval(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = Store(Path(tmpdir) / "overwatch.sqlite3")
@@ -685,6 +781,28 @@ class WorkerTest(unittest.IsolatedAsyncioTestCase):
             await run_once(store, github=github, registry=ProviderRegistry([FakeProvider()]))
 
             self.assertEqual(len(github.reviewed), 1)
+            self.assertEqual(len(github.merged), 0)
+            self.assertEqual(store.watched_prs()[0].status, "unresolved")
+
+    async def test_failing_ci_does_not_merge_even_with_bot_approval(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = Store(Path(tmpdir) / "overwatch.sqlite3")
+            pr = parse_pr_url("https://github.com/example/repo/pull/42")
+            store.watch_pr(
+                pr,
+                provider="opencode",
+                model=None,
+                harness=None,
+                merge_on_bot_approval=True,
+            )
+            github = FakeGitHubClient(
+                CiStatus(state="failure", head_sha="abc123", summary="tests failed", details={}),
+                CodexReviewDecision(approved=True, summary="Codex review: no major issues"),
+            )
+
+            await run_once(store, github=github, registry=ProviderRegistry([FakeProvider()]))
+
+            self.assertEqual(len(github.reviewed), 0)
             self.assertEqual(len(github.merged), 0)
             self.assertEqual(store.watched_prs()[0].status, "unresolved")
 
