@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import io
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
-from overwatch.cli import _format_review_thread
+from overwatch.cli import _print_watched_prs
 from overwatch.github import (
     CiStatus,
     CodexReviewDecision,
@@ -368,24 +371,38 @@ class GitHubClientTest(unittest.TestCase):
 
 
 class CliTest(unittest.TestCase):
-    def test_format_review_thread_includes_location_author_and_url(self) -> None:
-        line = _format_review_thread(
-            ReviewThread(
-                id="THREAD2",
-                author="codex",
-                body="Please remove this smoke test.",
-                url="https://github.com/example/repo/pull/1#discussion_r2",
-                path="src/example.py",
-                line=12,
-                created_at="2026-05-15T00:01:00Z",
-            )
-        )
+    def test_list_prints_comment_count_without_review_thread_details(self) -> None:
+        class ListGitHubClient:
+            def get_unresolved_review_threads(self, pr: PullRequestRef) -> list[ReviewThread]:
+                return [
+                    ReviewThread(
+                        id="THREAD2",
+                        author="codex",
+                        body="<sub><sub>P2 Badge</sub></sub> Please remove this smoke test.",
+                        url="https://github.com/example/repo/pull/1#discussion_r2",
+                        path="src/example.py",
+                        line=12,
+                        created_at="2026-05-15T00:01:00Z",
+                    )
+                ]
 
-        self.assertEqual(
-            line,
-            "codex src/example.py:12: Please remove this smoke test. "
-            "https://github.com/example/repo/pull/1#discussion_r2",
-        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = Store(Path(tmpdir) / "overwatch.sqlite3")
+            store.init()
+            store.watch_pr(
+                parse_pr_url("https://github.com/example/repo/pull/42"),
+                provider="opencode",
+                model=None,
+                harness=None,
+            )
+            output = io.StringIO()
+
+            with patch("overwatch.cli.GitHubClient", ListGitHubClient), redirect_stdout(output):
+                _print_watched_prs(store, include_inactive=False)
+
+        self.assertEqual(len(output.getvalue().splitlines()), 2)
+        self.assertIn("1        https://github.com/example/repo/pull/42", output.getvalue())
+        self.assertNotIn("P2 Badge", output.getvalue())
 
 
 class StoreTest(unittest.TestCase):
