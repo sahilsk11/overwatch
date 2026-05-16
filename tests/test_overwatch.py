@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -9,8 +10,15 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
+from overwatch.agent_context import AgentContext, AgentPriorTurn
 from overwatch.api import create_app
-from overwatch.cli import _print_watched_prs
+from overwatch.cli import (
+    _context_summary,
+    _print_watched_prs,
+    _session_warning,
+    _validate_session_options,
+)
+from overwatch.domain import CiSnapshot, PullRequestSnapshot, ReviewSnapshot, ReviewSubmission
 from overwatch.github import (
     CiStatus,
     CodexReviewDecision,
@@ -24,7 +32,8 @@ from overwatch.github import (
     _unresolved_review_threads,
     parse_pr_url,
 )
-from overwatch.providers import AgentConfig, ProviderRegistry
+from overwatch.policy import CiPolicy
+from overwatch.providers import AgentConfig, CliProvider, ProviderRegistry
 from overwatch.store import Store
 from overwatch.worker import run_once
 
@@ -32,12 +41,13 @@ from overwatch.worker import run_once
 class FakeGitHubClient:
     def __init__(
         self,
-        status: CiStatus,
+        status: CiStatus | list[CiStatus],
         decision: CodexReviewDecision | None = None,
         review_threads: list[ReviewThread] | None = None,
         review_threads_error: RuntimeError | None = None,
     ) -> None:
-        self.status = status
+        self.statuses = status if isinstance(status, list) else [status]
+        self._status_index = 0
         self.decision = decision or CodexReviewDecision(approved=False, summary="No approval")
         self.review_threads = review_threads or []
         self.review_threads_error = review_threads_error
@@ -48,10 +58,41 @@ class FakeGitHubClient:
         self.merged: list[PullRequestRef] = []
         self.merge_head_shas: list[str | None] = []
         self.review_requests: list[PullRequestRef] = []
+        self.review_request_head_shas: list[str | None] = []
+
+    @property
+    def status(self) -> CiStatus:
+        return self.statuses[min(self._status_index, len(self.statuses) - 1)]
 
     def get_ci_status(self, pr: PullRequestRef) -> CiStatus:
         self.checked.append(pr)
-        return self.status
+        status = self.statuses[min(self._status_index, len(self.statuses) - 1)]
+        self._status_index += 1
+        return status
+
+    def get_pr_snapshot(self, pr: PullRequestRef) -> PullRequestSnapshot:
+        status = self.statuses[min(self._status_index, len(self.statuses) - 1)]
+        return PullRequestSnapshot(
+            ref=pr,
+            state=status.pr_state,
+            draft=False,
+            mergeable=None,
+            head_sha=status.head_sha,
+            base_branch="main",
+            merged=status.merged,
+        )
+
+    def get_ci_snapshot(
+        self,
+        pr: PullRequestRef,
+        pr_snapshot: PullRequestSnapshot | None = None,
+    ) -> CiSnapshot:
+        self.checked.append(pr)
+        status = self.statuses[min(self._status_index, len(self.statuses) - 1)]
+        self._status_index += 1
+        details = dict(status.details)
+        details.setdefault("head_sha", status.head_sha)
+        return CiPolicy.snapshot_from_status(status.state, details)
 
     def get_codex_review_decision(
         self,
@@ -61,6 +102,28 @@ class FakeGitHubClient:
         self.reviewed.append(pr)
         self.review_head_shas.append(head_sha)
         return self.decision
+
+    def get_review_snapshot(
+        self,
+        pr: PullRequestRef,
+        head_sha: str | None = None,
+    ) -> ReviewSnapshot:
+        self.reviewed.append(pr)
+        self.review_head_shas.append(head_sha)
+        review_state = "APPROVED" if self.decision.approved else "COMMENTED"
+        return ReviewSnapshot(
+            reviews=(
+                ReviewSubmission(
+                    author="codex",
+                    state=review_state,
+                    body=self.decision.summary,
+                    commit_id=head_sha,
+                    created_at="2026-05-15T00:01:00Z",
+                ),
+            ),
+            issue_comments=(),
+            head_sha=head_sha,
+        )
 
     def get_unresolved_review_threads(self, pr: PullRequestRef) -> list[ReviewThread]:
         self.thread_checked.append(pr)
@@ -74,6 +137,7 @@ class FakeGitHubClient:
 
     def request_codex_review(self, pr: PullRequestRef, head_sha: str | None = None) -> None:
         self.review_requests.append(pr)
+        self.review_request_head_shas.append(head_sha)
 
 
 class FakeProvider:
@@ -189,6 +253,71 @@ class CiStatusTest(unittest.TestCase):
 
 
 class GitHubClientTest(unittest.TestCase):
+    def test_ci_snapshot_prefers_pr_rollup_and_preserves_source_errors(self) -> None:
+        class SnapshotClient(GitHubClient):
+            def _request(
+                self,
+                path: str,
+                *,
+                method: str = "GET",
+                data: dict[str, object] | None = None,
+            ) -> dict[str, object]:
+                if path.endswith("/pulls/42"):
+                    return {
+                        "state": "open",
+                        "merged": False,
+                        "head": {"sha": "abc123"},
+                        "base": {"ref": "main"},
+                    }
+                if path.endswith("/commits/abc123/status"):
+                    return {"state": "success", "statuses": []}
+                if path.endswith("/commits/abc123/check-runs"):
+                    raise RuntimeError("GitHub API error 403")
+                if "/actions/runs?" in path:
+                    return {"workflow_runs": []}
+                raise AssertionError(f"unexpected path: {path}")
+
+            def _graphql(self, query: str, variables: dict[str, object]) -> dict[str, object]:
+                return {
+                    "repository": {
+                        "pullRequest": {
+                            "commits": {
+                                "nodes": [
+                                    {
+                                        "commit": {
+                                            "statusCheckRollup": {
+                                                "state": "FAILURE",
+                                                "contexts": {
+                                                    "nodes": [
+                                                        {
+                                                            "__typename": "CheckRun",
+                                                            "name": "CI",
+                                                            "status": "COMPLETED",
+                                                            "conclusion": "FAILURE",
+                                                            "detailsUrl": "https://example.test/ci",
+                                                        }
+                                                    ]
+                                                },
+                                            }
+                                        }
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                }
+
+        pr = PullRequestRef("example", "repo", 42, "https://github.com/example/repo/pull/42")
+        client = SnapshotClient(token="token")
+
+        pr_snapshot = client.get_pr_snapshot(pr)
+        ci_snapshot = client.get_ci_snapshot(pr, pr_snapshot)
+
+        self.assertEqual(ci_snapshot.rollup_state, "failure")
+        self.assertEqual(ci_snapshot.source_errors["check_runs"], "GitHub API error 403")
+        self.assertEqual(ci_snapshot.rollup_contexts[0].name, "CI")
+        self.assertEqual(ci_snapshot.details_json["check_runs"]["error"], "GitHub API error 403")
+
     def test_request_all_pages_follows_link_header(self) -> None:
         class PagingClient(GitHubClient):
             def __init__(self) -> None:
@@ -438,8 +567,62 @@ class CliTest(unittest.TestCase):
                 _print_watched_prs(store, include_inactive=False)
 
         self.assertEqual(len(output.getvalue().splitlines()), 2)
-        self.assertIn("1        https://github.com/example/repo/pull/42", output.getvalue())
+        self.assertIn("context-summary", output.getvalue())
+        self.assertIn("https://github.com/example/repo/pull/42", output.getvalue())
         self.assertNotIn("P2 Badge", output.getvalue())
+
+    def test_context_summary_combines_cli_text_and_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            context_file = Path(tmpdir) / "context.md"
+            context_file.write_text("File context", encoding="utf-8")
+
+            summary = _context_summary("CLI context", context_file)
+
+        self.assertEqual(summary, "CLI context\n\nFile context")
+
+    def test_attached_session_cli_options_require_explicit_session_id(self) -> None:
+        with self.assertRaisesRegex(ValueError, "--session-id is required"):
+            _validate_session_options("attached-session", None)
+
+        _validate_session_options("attached-session", "codex-session-123")
+        warning = _session_warning("attached-session")
+
+        self.assertIsNotNone(warning)
+        assert warning is not None
+        self.assertIn("provider session resume is not implemented yet", warning)
+
+
+class AgentContextTest(unittest.TestCase):
+    def test_render_prompt_includes_policy_context_and_stop_expectations(self) -> None:
+        prompt = AgentContext(
+            pr_url="https://github.com/example/repo/pull/42",
+            repository="example/repo",
+            pr_number=42,
+            head_sha="abc123",
+            provider="codex",
+            model="gpt-5.5",
+            harness=None,
+            autofix=True,
+            merge_on_bot_approval=True,
+            max_turns=3,
+            turns_used=2,
+            context_summary="This product allows merge with bot approval when no CI is configured.",
+            current_blockers="Unresolved review comments:\n- codex: remove no-CI merge behavior",
+            prior_turns=(
+                AgentPriorTurn(
+                    turn_number=1,
+                    starting_head_sha="old-sha",
+                    status="completed",
+                    completed_at="2026-05-15T00:00:00Z",
+                ),
+            ),
+        ).render_prompt()
+
+        self.assertIn("Review comments are hypotheses", prompt)
+        self.assertIn("Preserve the no-CI merge policy", prompt)
+        self.assertIn("remove no-CI merge behavior", prompt)
+        self.assertIn("Turn 1: head old-sha", prompt)
+        self.assertIn("Final output must summarize blockers evaluated", prompt)
 
 
 class StoreTest(unittest.TestCase):
@@ -454,14 +637,62 @@ class StoreTest(unittest.TestCase):
                 provider="codex",
                 model="gpt-5.5",
                 harness="full",
+                context_summary="Preserve the private repo no-CI policy.",
                 merge_on_bot_approval=True,
             )
 
             self.assertEqual(watched.provider, "codex")
             self.assertEqual(watched.model, "gpt-5.5")
             self.assertEqual(watched.harness, "full")
+            self.assertEqual(watched.context_summary, "Preserve the private repo no-CI policy.")
+            self.assertEqual(watched.session_strategy, "context-summary")
+            self.assertIsNone(watched.session_id)
             self.assertTrue(watched.merge_on_bot_approval)
             self.assertEqual(len(store.unresolved_prs()), 1)
+
+    def test_watch_pr_persists_session_strategy_and_session_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = Store(Path(tmpdir) / "overwatch.sqlite3")
+            pr = parse_pr_url("https://github.com/example/repo/pull/42")
+
+            fresh = store.watch_pr(
+                pr,
+                provider="opencode",
+                model=None,
+                harness=None,
+                session_strategy="fresh",
+            )
+
+            self.assertEqual(fresh.session_strategy, "fresh")
+            self.assertIsNone(fresh.session_id)
+
+            attached = store.watch_pr(
+                pr,
+                provider="opencode",
+                model=None,
+                harness=None,
+                session_strategy="attached-session",
+                session_id="codex-session-123",
+            )
+
+            self.assertEqual(attached.session_strategy, "attached-session")
+            self.assertEqual(attached.session_id, "codex-session-123")
+            self.assertEqual(store.watched_prs()[0].session_strategy, "attached-session")
+            self.assertEqual(store.watched_prs()[0].session_id, "codex-session-123")
+
+    def test_attached_session_requires_session_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = Store(Path(tmpdir) / "overwatch.sqlite3")
+            pr = parse_pr_url("https://github.com/example/repo/pull/42")
+
+            with self.assertRaisesRegex(ValueError, "attached-session requires session_id"):
+                store.watch_pr(
+                    pr,
+                    provider="opencode",
+                    model=None,
+                    harness=None,
+                    session_strategy="attached-session",
+                )
 
     def test_watched_prs_includes_latest_ci_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -499,6 +730,47 @@ class StoreTest(unittest.TestCase):
             self.assertEqual(store.watched_prs(), [])
             self.assertEqual(store.watched_prs(include_inactive=True)[0].status, "resolved")
 
+    def test_pause_resume_and_stop_statuses(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = Store(Path(tmpdir) / "overwatch.sqlite3")
+            pr = parse_pr_url("https://github.com/example/repo/pull/42")
+            watched = store.watch_pr(pr, provider="opencode", model=None, harness=None)
+
+            paused = store.pause_watch(watched.id)
+            self.assertEqual(paused.status, "paused")
+            self.assertEqual(store.unresolved_prs(), [])
+            self.assertEqual(store.watched_prs()[0].worker_status, "paused")
+
+            resumed = store.resume_watch(watched.id)
+            self.assertEqual(resumed.status, "unresolved")
+            self.assertEqual(len(store.unresolved_prs()), 1)
+
+            stopped = store.stop_watch(watched.id)
+            self.assertEqual(stopped.status, "stopped")
+            self.assertEqual(store.watched_prs(), [])
+            self.assertEqual(store.watched_prs(include_inactive=True)[0].status, "stopped")
+
+    def test_watched_prs_includes_attempt_visibility_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = Store(Path(tmpdir) / "overwatch.sqlite3")
+            pr = parse_pr_url("https://github.com/example/repo/pull/42")
+            watched = store.watch_pr(pr, provider="opencode", model=None, harness=None)
+
+            attempt_id = store.start_attempt(watched, "abc123")
+            store.record_attempt_diagnostics(
+                attempt_id,
+                provider_command="opencode run",
+                provider_output="starting",
+            )
+            row = store.watched_prs()[0]
+
+            self.assertEqual(row.worker_status, "running")
+            self.assertEqual(row.active_attempt_id, attempt_id)
+            self.assertEqual(row.active_attempt_status, "running")
+            self.assertIsNotNone(row.active_attempt_elapsed_seconds)
+            self.assertEqual(row.last_provider_command, "opencode run")
+            self.assertEqual(row.last_provider_output, "starting")
+
 
 class ApiTest(unittest.TestCase):
     def test_health_and_watch_list_get_pr(self) -> None:
@@ -514,6 +786,7 @@ class ApiTest(unittest.TestCase):
                         "url": "https://github.com/example/repo/pull/42",
                         "provider": "codex",
                         "model": "gpt-5.5",
+                        "context": "Phase 4 context",
                         "autofix": True,
                     },
                 )
@@ -524,9 +797,45 @@ class ApiTest(unittest.TestCase):
             self.assertEqual(health.json(), {"status": "ok"})
             self.assertEqual(created.status_code, 201)
             self.assertEqual(created.json()["provider"], "codex")
+            self.assertEqual(created.json()["context_summary"], "Phase 4 context")
+            self.assertEqual(created.json()["session_strategy"], "context-summary")
+            self.assertIsNone(created.json()["session_id"])
             self.assertTrue(created.json()["autofix"])
             self.assertEqual(len(listed.json()), 1)
+            self.assertEqual(listed.json()[0]["session_strategy"], "context-summary")
+            self.assertEqual(listed.json()[0]["worker_status"], "watching")
+            self.assertEqual(listed.json()[0]["turns_used"], 0)
+            self.assertEqual(listed.json()[0]["max_turns"], 3)
+            self.assertIsNone(listed.json()[0]["active_attempt_id"])
             self.assertEqual(fetched.json()["url"], "https://github.com/example/repo/pull/42")
+
+    def test_attached_session_api_requires_session_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = Store(Path(tmpdir) / "overwatch.sqlite3")
+            app = create_app(store=store, static_dir=Path(tmpdir) / "static")
+
+            with TestClient(app) as client:
+                missing_id = client.post(
+                    "/api/prs",
+                    json={
+                        "url": "https://github.com/example/repo/pull/42",
+                        "session_strategy": "attached-session",
+                    },
+                )
+                created = client.post(
+                    "/api/prs",
+                    json={
+                        "url": "https://github.com/example/repo/pull/42",
+                        "session_strategy": "attached-session",
+                        "session_id": "codex-session-123",
+                    },
+                )
+
+            self.assertEqual(missing_id.status_code, 422)
+            self.assertIn("attached-session requires session_id", missing_id.json()["detail"])
+            self.assertEqual(created.status_code, 201)
+            self.assertEqual(created.json()["session_strategy"], "attached-session")
+            self.assertEqual(created.json()["session_id"], "codex-session-123")
 
     def test_pr_buckets_split_active_done_and_all(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -574,7 +883,13 @@ class ApiTest(unittest.TestCase):
                 ),
             )
             attempt_id = store.start_attempt(watched, "abc123")
-            store.finish_attempt(attempt_id, status="failed", error="boom")
+            store.finish_attempt(
+                attempt_id,
+                status="failed",
+                error="boom",
+                provider_command="opencode run",
+                provider_output="stderr:\nboom",
+            )
             app = create_app(store=store, static_dir=Path(tmpdir) / "static")
 
             with TestClient(app) as client:
@@ -586,6 +901,37 @@ class ApiTest(unittest.TestCase):
             self.assertEqual(events["ci_history"][0]["details"], {"jobs": ["test"]})
             self.assertEqual(events["resolution_attempts"][0]["status"], "failed")
             self.assertEqual(events["resolution_attempts"][0]["error"], "boom")
+            self.assertEqual(events["resolution_attempts"][0]["turn_number"], 1)
+            self.assertEqual(events["resolution_attempts"][0]["provider_command"], "opencode run")
+            self.assertEqual(events["resolution_attempts"][0]["provider_output"], "stderr:\nboom")
+
+    def test_pause_resume_stop_api_controls(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = Store(Path(tmpdir) / "overwatch.sqlite3")
+            watched = store.watch_pr(
+                parse_pr_url("https://github.com/example/repo/pull/42"),
+                provider="opencode",
+                model=None,
+                harness=None,
+            )
+            app = create_app(store=store, static_dir=Path(tmpdir) / "static")
+
+            with TestClient(app) as client:
+                paused = client.post(f"/api/prs/{watched.id}/pause")
+                active_rows = client.get("/api/prs?bucket=active")
+                resumed = client.post(f"/api/prs/{watched.id}/resume")
+                stopped = client.post(f"/api/prs/{watched.id}/stop")
+                done_rows = client.get("/api/prs?bucket=done")
+
+            self.assertEqual(paused.status_code, 200)
+            self.assertEqual(paused.json()["status"], "paused")
+            self.assertEqual(paused.json()["worker_status"], "paused")
+            self.assertEqual([row["status"] for row in active_rows.json()], ["paused"])
+            self.assertEqual(resumed.status_code, 200)
+            self.assertEqual(resumed.json()["status"], "unresolved")
+            self.assertEqual(stopped.status_code, 200)
+            self.assertEqual(stopped.json()["status"], "stopped")
+            self.assertEqual([row["status"] for row in done_rows.json()], ["stopped"])
 
     def test_refresh_records_single_github_status(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -731,7 +1077,9 @@ class WorkerTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(github.merge_head_shas, ["abc123"])
             self.assertEqual(store.watched_prs(include_inactive=True)[0].status, "merged")
 
-    async def test_unknown_ci_with_missing_check_details_does_not_merge(self) -> None:
+    async def test_check_runs_visibility_error_with_no_contexts_merges_with_bot_approval(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = Store(Path(tmpdir) / "overwatch.sqlite3")
             pr = parse_pr_url("https://github.com/example/repo/pull/42")
@@ -750,6 +1098,37 @@ class WorkerTest(unittest.IsolatedAsyncioTestCase):
                     details={
                         "combined_status": {"statuses": []},
                         "check_runs": {"error": "GitHub API error 403"},
+                        "actions": {"workflow_runs": []},
+                    },
+                ),
+                CodexReviewDecision(approved=True, summary="Codex review: no major issues"),
+            )
+
+            await run_once(store, github=github, registry=ProviderRegistry([FakeProvider()]))
+
+            self.assertEqual(len(github.reviewed), 1)
+            self.assertEqual(len(github.merged), 1)
+            self.assertEqual(store.watched_prs(include_inactive=True)[0].status, "merged")
+
+    async def test_incomplete_ci_data_does_not_merge_with_bot_approval(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = Store(Path(tmpdir) / "overwatch.sqlite3")
+            pr = parse_pr_url("https://github.com/example/repo/pull/42")
+            store.watch_pr(
+                pr,
+                provider="opencode",
+                model=None,
+                harness=None,
+                merge_on_bot_approval=True,
+            )
+            github = FakeGitHubClient(
+                CiStatus(
+                    state="unknown",
+                    head_sha="abc123",
+                    summary="No CI checks reported.",
+                    details={
+                        "combined_status": {"statuses": []},
+                        "check_runs": {"error": "GitHub API error 503"},
                         "actions": {"workflow_runs": []},
                     },
                 ),
@@ -806,6 +1185,37 @@ class WorkerTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(github.merged), 0)
             self.assertEqual(store.watched_prs()[0].status, "unresolved")
 
+    async def test_ci_summary_text_is_not_merge_policy_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = Store(Path(tmpdir) / "overwatch.sqlite3")
+            pr = parse_pr_url("https://github.com/example/repo/pull/42")
+            store.watch_pr(
+                pr,
+                provider="opencode",
+                model=None,
+                harness=None,
+                merge_on_bot_approval=True,
+            )
+            github = FakeGitHubClient(
+                CiStatus(
+                    state="failure",
+                    head_sha="abc123",
+                    summary="No CI checks reported.",
+                    details={
+                        "combined_status": {"statuses": []},
+                        "check_runs": {"check_runs": []},
+                        "actions": {"workflow_runs": []},
+                    },
+                ),
+                CodexReviewDecision(approved=True, summary="Codex review: no major issues"),
+            )
+
+            await run_once(store, github=github, registry=ProviderRegistry([FakeProvider()]))
+
+            self.assertEqual(len(github.reviewed), 0)
+            self.assertEqual(len(github.merged), 0)
+            self.assertEqual(store.watched_prs()[0].status, "unresolved")
+
     async def test_review_thread_failure_defers_merge_on_bot_approval(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = Store(Path(tmpdir) / "overwatch.sqlite3")
@@ -838,6 +1248,7 @@ class WorkerTest(unittest.IsolatedAsyncioTestCase):
                 provider="opencode",
                 model=None,
                 harness=None,
+                context_summary="No configured CI plus Codex approval is merge-eligible.",
                 autofix=True,
                 merge_on_bot_approval=True,
             )
@@ -852,7 +1263,67 @@ class WorkerTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(provider.calls), 1)
             prompt, _config = provider.calls[0]
             self.assertIn("CI failure:", prompt)
-            self.assertIn("tests failed", prompt)
+            self.assertIn("CI failed, but no failing context details were reported.", prompt)
+
+    async def test_fresh_session_strategy_omits_durable_context_from_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = Store(Path(tmpdir) / "overwatch.sqlite3")
+            pr = parse_pr_url("https://github.com/example/repo/pull/42")
+            watched = store.watch_pr(
+                pr,
+                provider="opencode",
+                model=None,
+                harness=None,
+                context_summary="Carry this durable context forward.",
+                session_strategy="fresh",
+                autofix=True,
+                max_turns=3,
+            )
+            prior_attempt_id = store.start_attempt(watched, "old-sha")
+            store.finish_attempt(prior_attempt_id, status="completed")
+            github = FakeGitHubClient(
+                CiStatus(state="failure", head_sha="abc123", summary="tests failed", details={})
+            )
+            provider = FakeProvider()
+
+            await run_once(store, github=github, registry=ProviderRegistry([provider]))
+
+            self.assertEqual(len(provider.calls), 1)
+            prompt, _config = provider.calls[0]
+            self.assertNotIn("Carry this durable context forward.", prompt)
+            self.assertNotIn("Turn 1: head old-sha", prompt)
+            self.assertIn("CI failure:", prompt)
+
+    async def test_context_summary_session_strategy_includes_durable_context_in_prompt(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = Store(Path(tmpdir) / "overwatch.sqlite3")
+            pr = parse_pr_url("https://github.com/example/repo/pull/42")
+            watched = store.watch_pr(
+                pr,
+                provider="opencode",
+                model=None,
+                harness=None,
+                context_summary="Carry this durable context forward.",
+                session_strategy="context-summary",
+                autofix=True,
+                max_turns=3,
+            )
+            prior_attempt_id = store.start_attempt(watched, "old-sha")
+            store.finish_attempt(prior_attempt_id, status="completed")
+            github = FakeGitHubClient(
+                CiStatus(state="failure", head_sha="abc123", summary="tests failed", details={})
+            )
+            provider = FakeProvider()
+
+            await run_once(store, github=github, registry=ProviderRegistry([provider]))
+
+            self.assertEqual(len(provider.calls), 1)
+            prompt, _config = provider.calls[0]
+            self.assertIn("Carry this durable context forward.", prompt)
+            self.assertIn("Turn 1: head old-sha", prompt)
+            self.assertIn("CI failure:", prompt)
 
     async def test_autofix_triggers_provider_for_unresolved_review_comments(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -863,6 +1334,7 @@ class WorkerTest(unittest.IsolatedAsyncioTestCase):
                 provider="opencode",
                 model=None,
                 harness=None,
+                context_summary="No configured CI plus Codex approval is merge-eligible.",
                 autofix=True,
                 merge_on_bot_approval=True,
             )
@@ -887,9 +1359,59 @@ class WorkerTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(provider.calls), 1)
             prompt, _config = provider.calls[0]
             self.assertIn("Please remove this smoke test.", prompt)
+            self.assertIn("No configured CI plus Codex approval is merge-eligible.", prompt)
+            self.assertIn("Review comments are hypotheses", prompt)
+            self.assertIn("Preserve the no-CI merge policy", prompt)
             self.assertIn("reply on the thread", prompt)
             self.assertIn("Resolve the review thread", prompt)
             self.assertEqual(len(github.review_requests), 1)
+
+    async def test_review_request_uses_refreshed_head_after_provider_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = Store(Path(tmpdir) / "overwatch.sqlite3")
+            pr = parse_pr_url("https://github.com/example/repo/pull/42")
+            watched = store.watch_pr(
+                pr,
+                provider="opencode",
+                model=None,
+                harness=None,
+                autofix=True,
+                merge_on_bot_approval=True,
+            )
+            github = FakeGitHubClient(
+                [
+                    CiStatus(
+                        state="success",
+                        head_sha="old-sha",
+                        summary="tests passed",
+                        details={},
+                    ),
+                    CiStatus(
+                        state="success",
+                        head_sha="new-sha",
+                        summary="tests passed",
+                        details={},
+                    ),
+                ],
+                review_threads=[
+                    ReviewThread(
+                        id="THREAD2",
+                        author="codex",
+                        body="Please remove this smoke test.",
+                        url="https://github.com/example/repo/pull/42#discussion_r2",
+                        path="src/example.py",
+                        line=12,
+                        created_at="2026-05-15T00:01:00Z",
+                    )
+                ],
+            )
+            provider = FakeProvider()
+
+            await run_once(store, github=github, registry=ProviderRegistry([provider]))
+
+            self.assertEqual(github.review_request_head_shas, ["new-sha"])
+            ci_history, _attempts = store.pr_events(watched.id)
+            self.assertEqual(ci_history[0].head_sha, "new-sha")
 
     async def test_review_comments_do_not_autofix_without_option(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -961,6 +1483,167 @@ class WorkerTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("https://github.com/example/repo/pull/42", prompt)
             self.assertEqual(config.model, "gpt-5.5")
             self.assertEqual(config.harness, "full")
+
+    async def test_paused_stopped_and_needs_human_watches_are_skipped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = Store(Path(tmpdir) / "overwatch.sqlite3")
+            paused = store.watch_pr(
+                parse_pr_url("https://github.com/example/repo/pull/42"),
+                provider="opencode",
+                model=None,
+                harness=None,
+                autofix=True,
+            )
+            stopped = store.watch_pr(
+                parse_pr_url("https://github.com/example/repo/pull/43"),
+                provider="opencode",
+                model=None,
+                harness=None,
+                autofix=True,
+            )
+            needs_human = store.watch_pr(
+                parse_pr_url("https://github.com/example/repo/pull/44"),
+                provider="opencode",
+                model=None,
+                harness=None,
+                autofix=True,
+            )
+            store.pause_watch(paused.id)
+            store.stop_watch(stopped.id)
+            store.mark_needs_human(needs_human.id)
+            github = FakeGitHubClient(
+                CiStatus(state="failure", head_sha="abc123", summary="tests failed", details={})
+            )
+            provider = FakeProvider()
+
+            await run_once(store, github=github, registry=ProviderRegistry([provider]))
+
+            self.assertEqual(len(provider.calls), 0)
+            self.assertEqual(len(github.checked), 0)
+
+    async def test_run_once_consumes_exactly_one_turn_for_one_provider_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = Store(Path(tmpdir) / "overwatch.sqlite3")
+            pr = parse_pr_url("https://github.com/example/repo/pull/42")
+            watched = store.watch_pr(
+                pr,
+                provider="opencode",
+                model=None,
+                harness=None,
+                autofix=True,
+                max_turns=3,
+            )
+            github = FakeGitHubClient(
+                CiStatus(state="failure", head_sha="abc123", summary="tests failed", details={})
+            )
+            provider = FakeProvider()
+
+            await run_once(store, github=github, registry=ProviderRegistry([provider]))
+
+            self.assertEqual(len(provider.calls), 1)
+            refreshed = store.get_pr(watched.id)
+            self.assertIsNotNone(refreshed)
+            assert refreshed is not None
+            self.assertEqual(refreshed.turns_used, 1)
+            self.assertEqual(refreshed.max_turns, 3)
+            turns = store.watch_turns(watched.id)
+            self.assertEqual(len(turns), 1)
+            self.assertEqual(turns[0].turn_number, 1)
+            self.assertEqual(turns[0].status, "completed")
+
+    async def test_turn_budget_exhaustion_marks_needs_human_without_provider_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = Store(Path(tmpdir) / "overwatch.sqlite3")
+            pr = parse_pr_url("https://github.com/example/repo/pull/42")
+            watched = store.watch_pr(
+                pr,
+                provider="opencode",
+                model=None,
+                harness=None,
+                autofix=True,
+                max_turns=1,
+            )
+            attempt_id = store.start_attempt(watched, "old-sha")
+            store.finish_attempt(attempt_id, status="failed", error="still failing")
+            github = FakeGitHubClient(
+                CiStatus(state="failure", head_sha="abc123", summary="tests failed", details={})
+            )
+            provider = FakeProvider()
+
+            await run_once(store, github=github, registry=ProviderRegistry([provider]))
+
+            self.assertEqual(len(provider.calls), 0)
+            refreshed = store.get_pr(watched.id)
+            self.assertIsNotNone(refreshed)
+            assert refreshed is not None
+            self.assertEqual(refreshed.status, "needs-human")
+            self.assertEqual(refreshed.turns_used, 1)
+
+    async def test_provider_command_failure_is_recorded_as_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = Store(Path(tmpdir) / "overwatch.sqlite3")
+            pr = parse_pr_url("https://github.com/example/repo/pull/42")
+            watched = store.watch_pr(
+                pr,
+                provider="opencode",
+                model=None,
+                harness=None,
+                autofix=True,
+            )
+            github = FakeGitHubClient(
+                CiStatus(state="failure", head_sha="abc123", summary="tests failed", details={})
+            )
+            provider = CliProvider(
+                "opencode",
+                [
+                    sys.executable,
+                    "-c",
+                    "import sys; sys.stdout.write('hello'); sys.stderr.write('boom'); sys.exit(7)",
+                ],
+            )
+
+            await run_once(store, github=github, registry=ProviderRegistry([provider]))
+
+            _ci_history, attempts = store.pr_events(watched.id)
+            self.assertEqual(len(attempts), 1)
+            self.assertEqual(attempts[0].status, "failed")
+            self.assertIn("opencode exited with 7", attempts[0].error or "")
+            self.assertIn("boom", attempts[0].error or "")
+            self.assertIn(sys.executable, attempts[0].provider_command or "")
+            self.assertIn("stdout:\nhello", attempts[0].provider_output or "")
+            self.assertIn("stderr:\nboom", attempts[0].provider_output or "")
+            turns = store.watch_turns(watched.id)
+            self.assertEqual(turns[0].status, "failed")
+
+    async def test_provider_output_is_truncated_for_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = Store(Path(tmpdir) / "overwatch.sqlite3")
+            pr = parse_pr_url("https://github.com/example/repo/pull/42")
+            watched = store.watch_pr(
+                pr,
+                provider="opencode",
+                model=None,
+                harness=None,
+                autofix=True,
+            )
+            github = FakeGitHubClient(
+                CiStatus(state="failure", head_sha="abc123", summary="tests failed", details={})
+            )
+            provider = CliProvider(
+                "opencode",
+                [
+                    sys.executable,
+                    "-c",
+                    "import sys; sys.stdout.write('x' * 13000)",
+                ],
+            )
+
+            await run_once(store, github=github, registry=ProviderRegistry([provider]))
+
+            _ci_history, attempts = store.pr_events(watched.id)
+            self.assertEqual(attempts[0].status, "completed")
+            self.assertLessEqual(len(attempts[0].provider_output or ""), 12_100)
+            self.assertIn("truncated to last 12000 chars", attempts[0].provider_output or "")
 
     async def test_failure_attempts_are_bounded_per_sha(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
