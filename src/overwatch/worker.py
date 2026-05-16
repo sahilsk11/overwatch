@@ -1,10 +1,26 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 
-from overwatch.github import CiStatus, GitHubClient, PullRequestRef, ReviewThread
-from overwatch.providers import AgentConfig, ProviderRegistry, default_registry
+from overwatch.agent_context import AgentContext, AgentPriorTurn
+from overwatch.domain import CiSnapshot, PullRequestRef, PullRequestSnapshot, ReviewThread
+from overwatch.github import GitHubClient, ci_status_from_snapshots
+from overwatch.policy import CiPolicy, CodexApprovalPolicy, MergePolicy, WatchPolicy
+from overwatch.providers import (
+    AgentConfig,
+    ProviderRegistry,
+    ProviderRunError,
+    ProviderRunResult,
+    default_registry,
+)
 from overwatch.store import Store, WatchedPullRequest
+
+
+@dataclass(frozen=True, slots=True)
+class Observation:
+    pr: PullRequestSnapshot
+    ci: CiSnapshot
 
 
 async def run_once(
@@ -24,48 +40,72 @@ async def run_once(
             number=watched.number,
             url=watched.url,
         )
-        status = github.get_ci_status(pr)
-        store.record_ci_status(watched.id, status)
+        observation = _observe_pr(store, github, pr, watched)
+        ci_decision = CiPolicy.classify(observation.ci)
+        watch_policy = WatchPolicy(
+            autofix=watched.autofix,
+            merge_on_bot_approval=watched.merge_on_bot_approval,
+        )
 
-        if status.merged:
+        if observation.pr.merged:
             store.mark_inactive(watched.id, status="merged")
             continue
-        if status.pr_state == "closed":
+        if observation.pr.state == "closed":
             store.mark_inactive(watched.id, status="closed")
             continue
         review_threads = _review_threads_for_work(github, pr, watched)
-        if watched.merge_on_bot_approval and _ci_allows_bot_merge(status):
+        if watched.merge_on_bot_approval and ci_decision.allows_bot_merge:
             if review_threads is None:
                 continue
             if review_threads:
-                attempt_count = store.attempt_count(watched.id, status.head_sha)
-                if watched.autofix and attempt_count < max_attempts_per_sha:
+                attempt_count = store.attempt_count(watched.id, observation.pr.head_sha)
+                if watched.autofix:
+                    if _turn_budget_exhausted(store, watched):
+                        continue
+                    if attempt_count >= max_attempts_per_sha:
+                        continue
                     completed = await _attempt_fix(
                         store,
                         registry,
                         watched,
-                        status.head_sha,
+                        observation.pr.head_sha,
                         _review_summary(review_threads),
                     )
                     if completed:
-                        github.request_codex_review(pr, status.head_sha)
+                        refreshed = _refresh_after_provider(store, github, pr, watched)
+                        if refreshed is not None:
+                            github.request_codex_review(pr, refreshed.pr.head_sha)
                 continue
-            decision = github.get_codex_review_decision(pr, status.head_sha)
-            if decision.approved:
-                github.merge_pr(pr, status.head_sha)
+            review_snapshot = github.get_review_snapshot(pr, observation.pr.head_sha)
+            approval_decision = CodexApprovalPolicy().evaluate(
+                review_snapshot,
+                observation.pr.head_sha,
+            )
+            merge_decision = MergePolicy().evaluate(
+                ci=ci_decision,
+                approval=approval_decision,
+                watch_policy=watch_policy,
+                unresolved_review_threads=review_threads,
+            )
+            if merge_decision.can_merge:
+                github.merge_pr(pr, observation.pr.head_sha)
                 store.mark_inactive(watched.id, status="merged")
             continue
         if not watched.autofix:
             continue
-        if status.state != "failure" and not review_threads:
+        if not ci_decision.should_autofix and not review_threads:
             continue
-        if store.attempt_count(watched.id, status.head_sha) >= max_attempts_per_sha:
+        if _turn_budget_exhausted(store, watched):
+            continue
+        if store.attempt_count(watched.id, observation.pr.head_sha) >= max_attempts_per_sha:
             continue
 
-        summary = _work_summary(status.summary, status.state, review_threads or [])
-        completed = await _attempt_fix(store, registry, watched, status.head_sha, summary)
+        summary = _work_summary(observation.ci, review_threads or [])
+        completed = await _attempt_fix(store, registry, watched, observation.pr.head_sha, summary)
         if completed and watched.merge_on_bot_approval:
-            github.request_codex_review(pr, status.head_sha)
+            refreshed = _refresh_after_provider(store, github, pr, watched)
+            if refreshed is not None:
+                github.request_codex_review(pr, refreshed.pr.head_sha)
 
 
 async def _attempt_fix(
@@ -74,17 +114,83 @@ async def _attempt_fix(
     watched: WatchedPullRequest,
     head_sha: str,
     summary: str,
-) -> None:
-    attempt_id = store.start_attempt(watched, head_sha)
-    provider = registry.get(watched.provider)
-    prompt = _build_prompt(watched, head_sha, summary)
-    config = AgentConfig(provider=watched.provider, model=watched.model, harness=watched.harness)
+) -> bool:
+    prior_turns = _agent_prior_turns(store, watched.id)
     try:
-        await provider.run(prompt, config)
+        attempt_id = store.start_attempt(watched, head_sha)
+    except RuntimeError:
+        return False
+    current_watched = store.get_pr(watched.id) or watched
+    provider = registry.get(watched.provider)
+    prompt = _build_prompt(current_watched, head_sha, summary, prior_turns)
+    config = AgentConfig(provider=watched.provider, model=watched.model, harness=watched.harness)
+    store.record_attempt_diagnostics(
+        attempt_id,
+        provider_command=_provider_command(provider, config),
+    )
+    attempt_finished = False
+    try:
+        result = await provider.run(prompt, config)
+    except ProviderRunError as exc:
+        store.finish_attempt(
+            attempt_id,
+            status="failed",
+            error=str(exc),
+            provider_command=exc.result.command,
+            provider_output=exc.result.output,
+        )
+        attempt_finished = True
+        return False
     except Exception as exc:
         store.finish_attempt(attempt_id, status="failed", error=str(exc))
+        attempt_finished = True
         return False
-    store.finish_attempt(attempt_id, status="completed")
+    except BaseException as exc:
+        store.finish_attempt(attempt_id, status="failed", error=f"interrupted: {exc}")
+        attempt_finished = True
+        raise
+    else:
+        provider_result = result if isinstance(result, ProviderRunResult) else None
+        store.finish_attempt(
+            attempt_id,
+            status="completed",
+            provider_command=provider_result.command if provider_result else None,
+            provider_output=provider_result.output if provider_result else None,
+        )
+        attempt_finished = True
+        return True
+    finally:
+        if not attempt_finished:
+            store.finish_attempt(
+                attempt_id,
+                status="failed",
+                error="attempt interrupted before provider completion",
+            )
+
+
+def _refresh_after_provider(
+    store: Store,
+    github: GitHubClient,
+    pr: PullRequestRef,
+    watched: WatchedPullRequest,
+) -> Observation | None:
+    try:
+        observation = _observe_pr(store, github, pr, watched)
+    except RuntimeError:
+        return None
+    if observation.pr.merged:
+        store.mark_inactive(watched.id, status="merged")
+        return None
+    if observation.pr.state == "closed":
+        store.mark_inactive(watched.id, status="closed")
+        return None
+    return observation
+
+
+def _turn_budget_exhausted(store: Store, watched: WatchedPullRequest) -> bool:
+    if watched.turns_used < watched.max_turns:
+        return False
+    store.mark_needs_human(watched.id)
     return True
 
 
@@ -125,50 +231,91 @@ def _review_summary(review_threads: list[ReviewThread]) -> str:
     return "\n".join(lines)
 
 
-def _work_summary(ci_summary: str, ci_state: str, review_threads: list[ReviewThread]) -> str:
+def _work_summary(ci_snapshot: CiSnapshot, review_threads: list[ReviewThread]) -> str:
     parts: list[str] = []
-    if ci_state == "failure":
-        parts.append(f"CI failure:\n{ci_summary}")
+    if ci_snapshot.rollup_state == "failure":
+        parts.append(f"CI failure:\n{_ci_failure_summary(ci_snapshot)}")
     if review_threads:
         parts.append(_review_summary(review_threads))
     return "\n\n".join(parts)
 
 
-def _ci_allows_bot_merge(status: CiStatus) -> bool:
-    if status.state == "success":
-        return True
-    return status.state == "unknown" and _has_explicit_no_ci_checks(status)
+def _observe_pr(
+    store: Store,
+    github: GitHubClient,
+    pr: PullRequestRef,
+    watched: WatchedPullRequest,
+) -> Observation:
+    pr_snapshot = github.get_pr_snapshot(pr)
+    ci_snapshot = github.get_ci_snapshot(pr, pr_snapshot)
+    store.record_ci_status(watched.id, ci_status_from_snapshots(pr_snapshot, ci_snapshot))
+    return Observation(pr=pr_snapshot, ci=ci_snapshot)
 
 
-def _has_explicit_no_ci_checks(status: CiStatus) -> bool:
-    combined = status.details.get("combined_status")
-    checks = status.details.get("check_runs")
-    actions = status.details.get("actions")
-    ci_sources = (combined, checks, actions)
-    if not all(isinstance(item, dict) and "error" not in item for item in ci_sources):
-        return False
-    return not (
-        combined.get("statuses")
-        or checks.get("check_runs")
-        or actions.get("workflow_runs")
+def _ci_failure_summary(snapshot: CiSnapshot) -> str:
+    contexts = [
+        context
+        for group in (
+            snapshot.rollup_contexts,
+            snapshot.legacy_statuses,
+            snapshot.check_runs,
+            snapshot.workflow_runs,
+        )
+        for context in (group or ())
+        if context.is_failing
+    ]
+    if not contexts and snapshot.source_errors:
+        return "\n".join(f"{source}: {error}" for source, error in snapshot.source_errors.items())
+    lines = []
+    for context in contexts:
+        state = context.state or context.status or "unknown"
+        conclusion = context.conclusion or ""
+        url = f" {context.url}" if context.url else ""
+        lines.append(f"{context.source} {context.name}: {state} {conclusion}{url}".strip())
+    return "\n".join(lines) if lines else "CI failed, but no failing context details were reported."
+
+
+def _agent_prior_turns(store: Store, pr_id: int) -> tuple[AgentPriorTurn, ...]:
+    turns = reversed(store.watch_turns(pr_id))
+    return tuple(
+        AgentPriorTurn(
+            turn_number=turn.turn_number,
+            starting_head_sha=turn.starting_head_sha,
+            status=turn.status,
+            completed_at=turn.completed_at,
+        )
+        for turn in turns
+        if turn.status != "running"
     )
 
 
-def _build_prompt(watched: WatchedPullRequest, head_sha: str, summary: str) -> str:
-    return f"""A GitHub PR needs automated follow-up.
+def _build_prompt(
+    watched: WatchedPullRequest,
+    head_sha: str,
+    summary: str,
+    prior_turns: tuple[AgentPriorTurn, ...] = (),
+) -> str:
+    include_durable_context = watched.session_strategy in {"context-summary", "attached-session"}
+    return AgentContext(
+        pr_url=watched.url,
+        repository=f"{watched.owner}/{watched.repo}",
+        pr_number=watched.number,
+        head_sha=head_sha,
+        provider=watched.provider,
+        model=watched.model,
+        harness=watched.harness,
+        autofix=watched.autofix,
+        merge_on_bot_approval=watched.merge_on_bot_approval,
+        max_turns=watched.max_turns,
+        turns_used=watched.turns_used,
+        context_summary=watched.context_summary if include_durable_context else "",
+        current_blockers=summary,
+        prior_turns=prior_turns if include_durable_context else (),
+    ).render_prompt()
 
-PR: {watched.url}
-Repository: {watched.owner}/{watched.repo}
-Head SHA: {head_sha}
 
-Blocking work summary:
-{summary}
-
-Address the blocking CI failure or unresolved review comments.
-Make the smallest correct code change and run the relevant tests.
-For each unresolved review comment, reply on the thread with either what you fixed
-or why no code change is needed.
-Resolve the review thread after you have addressed it or clearly explained why it is not applicable.
-If you are in the target repository on the PR branch, commit the fix and push it.
-Do not amend commits or force push.
-"""
+def _provider_command(provider: object, config: AgentConfig) -> str | None:
+    command_display = getattr(provider, "command_display", None)
+    if callable(command_display):
+        return str(command_display(config))
+    return None

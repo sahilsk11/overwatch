@@ -9,9 +9,12 @@ import {
   Clock3,
   GitPullRequest,
   Loader2,
+  Pause,
+  Play,
   Plus,
   RefreshCw,
   Search,
+  Square,
   TerminalSquare,
   X,
 } from "lucide-react";
@@ -45,10 +48,22 @@ interface PullRequestSummary {
   harness?: string | null;
   autofix?: boolean;
   merge_on_bot_approval?: boolean;
+  max_turns?: number;
+  turns_used?: number;
   latest_ci_state?: string | null;
   latest_head_sha?: string | null;
   latest_summary?: string | null;
   latest_checked_at?: string | null;
+  worker_status?: string | null;
+  active_attempt_id?: number | null;
+  active_attempt_started_at?: string | null;
+  active_attempt_elapsed_seconds?: number | null;
+  active_attempt_status?: string | null;
+  last_attempt_status?: string | null;
+  last_attempt_completed_at?: string | null;
+  last_provider_command?: string | null;
+  last_provider_output?: string | null;
+  last_error?: string | null;
 }
 
 interface PullRequestDetail extends PullRequestSummary {
@@ -67,11 +82,15 @@ interface CiHistoryEvent {
 
 interface ResolutionAttempt {
   id?: string | number;
+  watch_turn_id?: string | number | null;
+  turn_number?: number | null;
   provider?: string | null;
   model?: string | null;
   harness?: string | null;
   head_sha?: string | null;
   status?: string | null;
+  provider_command?: string | null;
+  provider_output?: string | null;
   created_at?: string | null;
   completed_at?: string | null;
   error?: string | null;
@@ -176,8 +195,10 @@ async function fetchPrEvents(id: string | number): Promise<PrEvent[]> {
         level: attempt.status ?? undefined,
         message: [
           attempt.provider || "provider",
+          attempt.turn_number ? `turn ${attempt.turn_number}` : null,
           attempt.model,
           attempt.head_sha ? `@ ${attempt.head_sha.slice(0, 8)}` : null,
+          attempt.status,
           attempt.error,
         ]
           .filter(Boolean)
@@ -201,6 +222,10 @@ async function refreshPr(id: string | number): Promise<void> {
   await requestJson<void>(`/api/prs/${id}/refresh`, { method: "POST" });
 }
 
+async function controlPr(id: string | number, action: "pause" | "resume" | "stop"): Promise<void> {
+  await requestJson<void>(`/api/prs/${id}/${action}`, { method: "POST" });
+}
+
 function formatDate(value?: string | null): string {
   if (!value) return "never";
   const date = new Date(value);
@@ -222,8 +247,10 @@ function prLabel(pr: PullRequestSummary): string {
 function statusTone(state?: string | null): "ok" | "warn" | "bad" | "neutral" {
   const normalized = (state ?? "").toLowerCase();
   if (["success", "merged", "done", "green", "ok", "passed"].includes(normalized)) return "ok";
-  if (["failure", "failed", "error", "closed", "red"].includes(normalized)) return "bad";
-  if (["pending", "running", "queued", "active", "open"].includes(normalized)) return "warn";
+  if (["failure", "failed", "error", "closed", "red", "stopped"].includes(normalized)) return "bad";
+  if (["pending", "running", "queued", "active", "open", "paused", "needs-human"].includes(normalized)) {
+    return "warn";
+  }
   return "neutral";
 }
 
@@ -285,6 +312,7 @@ function App() {
   const [health, setHealth] = React.useState<HealthStatus>("checking");
   const [query, setQuery] = React.useState("");
   const [refreshingId, setRefreshingId] = React.useState<string | number | null>(null);
+  const [controlBusy, setControlBusy] = React.useState<string | null>(null);
   const [form, setForm] = React.useState<CreatePrRequest>({
     url: "",
     provider: "codex",
@@ -380,6 +408,16 @@ function App() {
       await Promise.all([loadPrs(), loadDetail(id)]);
     } finally {
       setRefreshingId(null);
+    }
+  }
+
+  async function handleControl(id: string | number, action: "pause" | "resume" | "stop") {
+    setControlBusy(`${action}:${id}`);
+    try {
+      await controlPr(id, action);
+      await Promise.all([loadPrs(), loadDetail(id)]);
+    } finally {
+      setControlBusy(null);
     }
   }
 
@@ -517,7 +555,9 @@ function App() {
           events={events}
           selectedId={selectedId}
           refreshingId={refreshingId}
+          controlBusy={controlBusy}
           onRefresh={handleRefresh}
+          onControl={handleControl}
           onRetry={() => selectedId !== null && loadDetail(selectedId)}
         />
       </section>
@@ -530,14 +570,18 @@ function DetailPanel({
   events,
   selectedId,
   refreshingId,
+  controlBusy,
   onRefresh,
+  onControl,
   onRetry,
 }: {
   detail: Loadable<PullRequestDetail | null>;
   events: Loadable<PrEvent[]>;
   selectedId: string | number | null;
   refreshingId: string | number | null;
+  controlBusy: string | null;
   onRefresh: (id: string | number) => void;
+  onControl: (id: string | number, action: "pause" | "resume" | "stop") => void;
   onRetry: () => void;
 }) {
   if (selectedId === null) {
@@ -586,22 +630,63 @@ function DetailPanel({
             {pr.url}
           </a>
         </div>
-        <button
-          type="button"
-          className="primary"
-          onClick={() => onRefresh(pr.id)}
-          disabled={refreshingId === pr.id}
-        >
-          {refreshingId === pr.id ? <Loader2 className="spin" /> : <RefreshCw />}
-          Refresh
-        </button>
+        <div className="action-row">
+          <button
+            type="button"
+            className="primary"
+            onClick={() => onRefresh(pr.id)}
+            disabled={refreshingId === pr.id}
+          >
+            {refreshingId === pr.id ? <Loader2 className="spin" /> : <RefreshCw />}
+            Refresh
+          </button>
+          {pr.status === "paused" ? (
+            <button
+              type="button"
+              className="ghost"
+              onClick={() => onControl(pr.id, "resume")}
+              disabled={controlBusy === `resume:${pr.id}`}
+            >
+              {controlBusy === `resume:${pr.id}` ? <Loader2 className="spin" /> : <Play />}
+              Resume
+            </button>
+          ) : (
+            <button
+              type="button"
+              className="ghost"
+              onClick={() => onControl(pr.id, "pause")}
+              disabled={pr.status === "stopped" || controlBusy === `pause:${pr.id}`}
+            >
+              {controlBusy === `pause:${pr.id}` ? <Loader2 className="spin" /> : <Pause />}
+              Pause
+            </button>
+          )}
+          <button
+            type="button"
+            className="ghost"
+            onClick={() => onControl(pr.id, "stop")}
+            disabled={pr.status === "stopped" || controlBusy === `stop:${pr.id}`}
+          >
+            {controlBusy === `stop:${pr.id}` ? <Loader2 className="spin" /> : <Square />}
+            Stop
+          </button>
+        </div>
       </div>
 
       <div className="metric-grid">
         <Metric label="State" value={<StatusPill value={pr.status} />} />
+        <Metric label="Worker" value={<StatusPill value={pr.worker_status} />} />
         <Metric label="CI" value={<StatusPill value={pr.latest_ci_state} />} />
+        <Metric label="Turns" value={`${pr.turns_used ?? 0}/${pr.max_turns ?? 0}`} />
+        <Metric label="Active" value={activeAttemptLabel(pr)} />
         <Metric label="Provider" value={pr.provider || "unset"} />
+      </div>
+
+      <div className="metric-grid secondary">
         <Metric label="Last Check" value={formatDate(pr.latest_checked_at ?? pr.updated_at)} />
+        <Metric label="Last Attempt" value={pr.last_attempt_status || "none"} />
+        <Metric label="Elapsed" value={elapsedLabel(pr.active_attempt_elapsed_seconds)} />
+        <Metric label="Last Error" value={pr.last_error || "none"} />
       </div>
 
       {pr.latest_summary ? (
@@ -665,7 +750,7 @@ function DetailPanel({
             <TerminalSquare aria-hidden="true" />
             <span>Logs</span>
           </div>
-          <pre className="log-box">{collectLogs(pr)}</pre>
+          <pre className="log-box">{collectLogs(pr, events.data)}</pre>
         </div>
       </section>
     </section>
@@ -681,8 +766,35 @@ function Metric({ label, value }: { label: string; value: React.ReactNode }) {
   );
 }
 
-function collectLogs(pr: PullRequestDetail): string {
-  const logs = [pr.latest_summary, pr.latest_head_sha ? `head ${pr.latest_head_sha}` : null].filter(Boolean);
+function activeAttemptLabel(pr: PullRequestDetail): string {
+  if (!pr.active_attempt_id) return "idle";
+  return `attempt ${pr.active_attempt_id}`;
+}
+
+function elapsedLabel(seconds?: number | null): string {
+  if (seconds === null || seconds === undefined) return "-";
+  if (seconds < 60) return `${seconds}s`;
+  return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+}
+
+function collectLogs(pr: PullRequestDetail, events: PrEvent[]): string {
+  const providerLogs = events
+    .map((event) => (isRecord(event.payload) ? (event.payload as ResolutionAttempt) : null))
+    .filter(Boolean)
+    .flatMap((attempt) => [
+      attempt?.turn_number ? `turn ${attempt.turn_number}` : null,
+      attempt?.provider_command ? `$ ${attempt.provider_command}` : null,
+      attempt?.provider_output ?? null,
+      attempt?.error ? `error: ${attempt.error}` : null,
+    ]);
+  const logs = [
+    pr.latest_summary,
+    pr.latest_head_sha ? `head ${pr.latest_head_sha}` : null,
+    pr.last_provider_command ? `$ ${pr.last_provider_command}` : null,
+    pr.last_provider_output,
+    pr.last_error ? `error: ${pr.last_error}` : null,
+    ...providerLogs,
+  ].filter(Boolean);
 
   return logs.length ? logs.join("\n\n") : "No agent logs recorded.";
 }

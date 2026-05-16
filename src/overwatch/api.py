@@ -8,10 +8,12 @@ from typing import Annotated, Any, Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from overwatch.github import GitHubClient, PullRequestRef, parse_pr_url
 from overwatch.store import (
+    DEFAULT_SESSION_STRATEGY,
+    DONE_STATUSES,
     Store,
     WatchedPullRequest,
     WatchedPullRequestSummary,
@@ -19,9 +21,7 @@ from overwatch.store import (
 )
 
 PrBucket = Literal["active", "done", "all"]
-
-DONE_STATUSES = frozenset({"resolved", "merged", "closed"})
-
+SessionStrategy = Literal["fresh", "context-summary", "attached-session"]
 
 class HealthResponse(BaseModel):
     status: Literal["ok"]
@@ -32,8 +32,13 @@ class WatchPrRequest(BaseModel):
     provider: str = "opencode"
     model: str | None = None
     harness: str | None = None
+    context: str | None = None
+    context_summary: str = ""
+    session_strategy: SessionStrategy = DEFAULT_SESSION_STRATEGY
+    session_id: str | None = None
     autofix: bool = False
     merge_on_bot_approval: bool = False
+    max_turns: int = Field(default=3, ge=1, le=10)
 
 
 class PrResponse(BaseModel):
@@ -48,14 +53,29 @@ class PrResponse(BaseModel):
     provider: str
     model: str | None
     harness: str | None
+    context_summary: str
+    session_strategy: str
+    session_id: str | None
     autofix: bool
     merge_on_bot_approval: bool
+    max_turns: int
+    turns_used: int
     created_at: str
     updated_at: str
     latest_ci_state: str | None = None
     latest_head_sha: str | None = None
     latest_summary: str | None = None
     latest_checked_at: str | None = None
+    worker_status: str | None = None
+    active_attempt_id: int | None = None
+    active_attempt_started_at: str | None = None
+    active_attempt_elapsed_seconds: int | None = None
+    active_attempt_status: str | None = None
+    last_attempt_status: str | None = None
+    last_attempt_completed_at: str | None = None
+    last_provider_command: str | None = None
+    last_provider_output: str | None = None
+    last_error: str | None = None
 
 
 class PrSummaryResponse(BaseModel):
@@ -70,12 +90,27 @@ class PrSummaryResponse(BaseModel):
     provider: str
     model: str | None
     harness: str | None
+    context_summary: str
+    session_strategy: str
+    session_id: str | None
     autofix: bool
     merge_on_bot_approval: bool
+    max_turns: int
+    turns_used: int
     latest_ci_state: str | None
     latest_head_sha: str | None
     latest_summary: str | None
     latest_checked_at: str | None
+    worker_status: str
+    active_attempt_id: int | None
+    active_attempt_started_at: str | None
+    active_attempt_elapsed_seconds: int | None
+    active_attempt_status: str | None
+    last_attempt_status: str | None
+    last_attempt_completed_at: str | None
+    last_provider_command: str | None
+    last_provider_output: str | None
+    last_error: str | None
 
 
 class CiHistoryResponse(BaseModel):
@@ -93,11 +128,15 @@ class ResolutionAttemptResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
+    watch_turn_id: int | None
+    turn_number: int | None
     provider: str
     model: str | None
     harness: str | None
     head_sha: str
     status: str
+    provider_command: str | None
+    provider_output: str | None
     error: str | None
     created_at: str
     completed_at: str | None
@@ -194,23 +233,33 @@ def create_app(
     def watch_pr(
         request: WatchPrRequest,
         store: StoreDependency,
-    ) -> WatchedPullRequest:
+    ) -> PrResponse:
         try:
             pr = parse_pr_url(request.url)
         except ValueError as exc:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=str(exc),
             ) from exc
-        watched = store.watch_pr(
-            pr,
-            provider=request.provider,
-            model=request.model,
-            harness=request.harness,
-            autofix=request.autofix,
-            merge_on_bot_approval=request.merge_on_bot_approval,
-        )
-        return PrResponse.model_validate(watched)
+        try:
+            watched = store.watch_pr(
+                pr,
+                provider=request.provider,
+                model=request.model,
+                harness=request.harness,
+                context_summary=_request_context_summary(request),
+                session_strategy=request.session_strategy,
+                session_id=request.session_id,
+                autofix=request.autofix,
+                merge_on_bot_approval=request.merge_on_bot_approval,
+                max_turns=request.max_turns,
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=str(exc),
+            ) from exc
+        return _pr_response_or_404(store, watched.id)
 
     @app.post("/api/prs/{pr_id}/refresh", response_model=RefreshResponse)
     def refresh_pr(
@@ -239,6 +288,39 @@ def create_app(
             pr=_pr_response_or_404(store, pr_id),
             ci_status=CiHistoryResponse.model_validate(ci_history[0]),
         )
+
+    @app.post("/api/prs/{pr_id}/pause", response_model=PrResponse)
+    def pause_pr(pr_id: int, store: StoreDependency) -> PrResponse:
+        try:
+            store.pause_watch(pr_id)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=str(exc),
+            ) from exc
+        return _pr_response_or_404(store, pr_id)
+
+    @app.post("/api/prs/{pr_id}/resume", response_model=PrResponse)
+    def resume_pr(pr_id: int, store: StoreDependency) -> PrResponse:
+        try:
+            store.resume_watch(pr_id)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=str(exc),
+            ) from exc
+        return _pr_response_or_404(store, pr_id)
+
+    @app.post("/api/prs/{pr_id}/stop", response_model=PrResponse)
+    def stop_pr(pr_id: int, store: StoreDependency) -> PrResponse:
+        try:
+            store.stop_watch(pr_id)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=str(exc),
+            ) from exc
+        return _pr_response_or_404(store, pr_id)
 
     @app.get("/{path:path}", include_in_schema=False)
     def serve_spa(path: str, request: Request) -> FileResponse:
@@ -269,9 +351,28 @@ def _pr_response_or_404(store: Store, pr_id: int) -> PrResponse:
                 "latest_head_sha": latest.latest_head_sha,
                 "latest_summary": latest.latest_summary,
                 "latest_checked_at": latest.latest_checked_at,
+                "worker_status": latest.worker_status,
+                "active_attempt_id": latest.active_attempt_id,
+                "active_attempt_started_at": latest.active_attempt_started_at,
+                "active_attempt_elapsed_seconds": latest.active_attempt_elapsed_seconds,
+                "active_attempt_status": latest.active_attempt_status,
+                "last_attempt_status": latest.last_attempt_status,
+                "last_attempt_completed_at": latest.last_attempt_completed_at,
+                "last_provider_command": latest.last_provider_command,
+                "last_provider_output": latest.last_provider_output,
+                "last_error": latest.last_error,
             }
         )
     return PrResponse.model_validate(payload)
+
+
+def _request_context_summary(request: WatchPrRequest) -> str:
+    parts = [
+        value.strip()
+        for value in (request.context_summary, request.context or "")
+        if value.strip()
+    ]
+    return "\n\n".join(parts)
 
 
 def _static_response(static_dir: Path, path: str) -> FileResponse:
