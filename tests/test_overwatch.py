@@ -34,7 +34,7 @@ from overwatch.github import (
 )
 from overwatch.policy import CiPolicy
 from overwatch.providers import AgentConfig, CliProvider, ProviderRegistry
-from overwatch.store import Store
+from overwatch.store import Store, WatchedPullRequest
 from overwatch.worker import run_once
 
 
@@ -1438,6 +1438,26 @@ class WorkerTest(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(len(provider.calls), 0)
             self.assertEqual(len(github.review_requests), 0)
+
+    async def test_attempt_start_race_skips_watch_without_crashing(self) -> None:
+        class RacingStore(Store):
+            def start_attempt(self, pr: WatchedPullRequest, head_sha: str) -> int:
+                raise RuntimeError("watch is paused")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = RacingStore(Path(tmpdir) / "overwatch.sqlite3")
+            pr = parse_pr_url("https://github.com/example/repo/pull/42")
+            store.watch_pr(pr, provider="opencode", model=None, harness=None, autofix=True)
+            github = FakeGitHubClient(
+                CiStatus(state="failure", head_sha="abc123", summary="tests failed", details={})
+            )
+            provider = FakeProvider()
+
+            await run_once(store, github=github, registry=ProviderRegistry([provider]))
+
+            self.assertEqual(len(provider.calls), 0)
+            _ci_history, attempts = store.pr_events(store.watched_prs()[0].id)
+            self.assertEqual(attempts, [])
 
     async def test_merged_pr_is_hidden_from_default_list(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

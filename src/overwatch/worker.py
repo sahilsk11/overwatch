@@ -116,7 +116,10 @@ async def _attempt_fix(
     summary: str,
 ) -> bool:
     prior_turns = _agent_prior_turns(store, watched.id)
-    attempt_id = store.start_attempt(watched, head_sha)
+    try:
+        attempt_id = store.start_attempt(watched, head_sha)
+    except RuntimeError:
+        return False
     current_watched = store.get_pr(watched.id) or watched
     provider = registry.get(watched.provider)
     prompt = _build_prompt(current_watched, head_sha, summary, prior_turns)
