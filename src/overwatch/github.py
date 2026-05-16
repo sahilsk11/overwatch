@@ -365,7 +365,9 @@ def _latest_codex_review_request_created_at(comments: object, head_sha: str | No
         fallback_timestamps.append(created_at)
         if head_sha is not None and head_sha.lower() in body:
             head_timestamps.append(created_at)
-    return max(head_timestamps or fallback_timestamps, default=None)
+    if head_sha is not None:
+        return max(head_timestamps, default=None)
+    return max(fallback_timestamps, default=None)
 
 
 def _comment_matches_head_window(

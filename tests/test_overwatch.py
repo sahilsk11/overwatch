@@ -344,7 +344,9 @@ class GitHubClientTest(unittest.TestCase):
 
         self.assertTrue(decision.approved)
 
-    def test_codex_review_decision_accepts_issue_comment_after_manual_request(self) -> None:
+    def test_codex_review_decision_accepts_issue_comment_after_unbound_manual_request_without_head(
+        self,
+    ) -> None:
         class CommentClient(GitHubClient):
             def _request_all_pages(self, path: str) -> list[dict[str, object]]:
                 if path.endswith("/reviews"):
@@ -365,8 +367,7 @@ class GitHubClientTest(unittest.TestCase):
         client = CommentClient(token="token")
 
         decision = client.get_codex_review_decision(
-            PullRequestRef("example", "repo", 42, "https://github.com/example/repo/pull/42"),
-            "current-sha",
+            PullRequestRef("example", "repo", 42, "https://github.com/example/repo/pull/42")
         )
 
         self.assertTrue(decision.approved)
@@ -377,6 +378,11 @@ class GitHubClientTest(unittest.TestCase):
                 if path.endswith("/reviews"):
                     return []
                 return [
+                    {
+                        "user": {"login": "sahilsk11"},
+                        "body": "@codex review",
+                        "created_at": "2026-05-15T00:01:30Z",
+                    },
                     {
                         "user": {"login": "codex"},
                         "body": "Codex review: didn't find any major issues.",
@@ -709,7 +715,11 @@ class WorkerTest(unittest.IsolatedAsyncioTestCase):
                     state="unknown",
                     head_sha="abc123",
                     summary="No CI checks reported.",
-                    details={},
+                    details={
+                        "combined_status": {"statuses": []},
+                        "check_runs": {"check_runs": []},
+                        "actions": {"workflow_runs": []},
+                    },
                 ),
                 CodexReviewDecision(approved=True, summary="Codex review: no major issues"),
             )
@@ -720,6 +730,37 @@ class WorkerTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(github.merged), 1)
             self.assertEqual(github.merge_head_shas, ["abc123"])
             self.assertEqual(store.watched_prs(include_inactive=True)[0].status, "merged")
+
+    async def test_unknown_ci_with_missing_check_details_does_not_merge(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = Store(Path(tmpdir) / "overwatch.sqlite3")
+            pr = parse_pr_url("https://github.com/example/repo/pull/42")
+            store.watch_pr(
+                pr,
+                provider="opencode",
+                model=None,
+                harness=None,
+                merge_on_bot_approval=True,
+            )
+            github = FakeGitHubClient(
+                CiStatus(
+                    state="unknown",
+                    head_sha="abc123",
+                    summary="No CI checks reported.",
+                    details={
+                        "combined_status": {"statuses": []},
+                        "check_runs": {"error": "GitHub API error 403"},
+                        "actions": {"workflow_runs": []},
+                    },
+                ),
+                CodexReviewDecision(approved=True, summary="Codex review: no major issues"),
+            )
+
+            await run_once(store, github=github, registry=ProviderRegistry([FakeProvider()]))
+
+            self.assertEqual(len(github.reviewed), 0)
+            self.assertEqual(len(github.merged), 0)
+            self.assertEqual(store.watched_prs(include_inactive=True)[0].status, "unresolved")
 
     async def test_success_does_not_merge_without_bot_approval(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
