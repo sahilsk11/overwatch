@@ -51,6 +51,29 @@ class WatchedPullRequestSummary:
     latest_checked_at: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class CiHistoryEvent:
+    id: int
+    head_sha: str
+    state: str
+    summary: str
+    details: dict[str, Any]
+    created_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class ResolutionAttemptEvent:
+    id: int
+    provider: str
+    model: str | None
+    harness: str | None
+    head_sha: str
+    status: str
+    error: str | None
+    created_at: str
+    completed_at: str | None
+
+
 class Store:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -164,6 +187,12 @@ class Store:
             ).fetchall()
         return [_watched_pr(row) for row in rows]
 
+    def get_pr(self, pr_id: int) -> WatchedPullRequest | None:
+        self.init()
+        with self.connect() as conn:
+            row = conn.execute("select * from watched_prs where id = ?", (pr_id,)).fetchone()
+        return _watched_pr(row) if row else None
+
     def watched_prs(self, *, include_inactive: bool = False) -> list[WatchedPullRequestSummary]:
         self.init()
         inactive_statuses = "'resolved', 'merged', 'closed'"
@@ -217,6 +246,33 @@ class Store:
                     _now(),
                 ),
             )
+
+    def pr_events(self, pr_id: int) -> tuple[list[CiHistoryEvent], list[ResolutionAttemptEvent]]:
+        self.init()
+        with self.connect() as conn:
+            ci_rows = conn.execute(
+                """
+                select id, head_sha, state, summary, details_json, created_at
+                from ci_check_history
+                where watched_pr_id = ?
+                order by created_at desc, id desc
+                """,
+                (pr_id,),
+            ).fetchall()
+            attempt_rows = conn.execute(
+                """
+                select id, provider, model, harness, head_sha, status, error, created_at,
+                       completed_at
+                from resolution_attempts
+                where watched_pr_id = ?
+                order by created_at desc, id desc
+                """,
+                (pr_id,),
+            ).fetchall()
+        return (
+            [_ci_history_event(row) for row in ci_rows],
+            [_resolution_attempt_event(row) for row in attempt_rows],
+        )
 
     def attempt_count(self, pr_id: int, head_sha: str) -> int:
         with self.connect() as conn:
@@ -282,6 +338,31 @@ def _watched_pr_summary(row: sqlite3.Row) -> WatchedPullRequestSummary:
     values["autofix"] = bool(values["autofix"])
     values["merge_on_bot_approval"] = bool(values["merge_on_bot_approval"])
     return WatchedPullRequestSummary(**values)
+
+
+def _ci_history_event(row: sqlite3.Row) -> CiHistoryEvent:
+    return CiHistoryEvent(
+        id=int(row["id"]),
+        head_sha=str(row["head_sha"]),
+        state=str(row["state"]),
+        summary=str(row["summary"]),
+        details=json.loads(row["details_json"]),
+        created_at=str(row["created_at"]),
+    )
+
+
+def _resolution_attempt_event(row: sqlite3.Row) -> ResolutionAttemptEvent:
+    return ResolutionAttemptEvent(
+        id=int(row["id"]),
+        provider=str(row["provider"]),
+        model=row["model"],
+        harness=row["harness"],
+        head_sha=str(row["head_sha"]),
+        status=str(row["status"]),
+        error=row["error"],
+        created_at=str(row["created_at"]),
+        completed_at=row["completed_at"],
+    )
 
 
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:

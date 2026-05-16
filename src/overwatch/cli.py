@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from pathlib import Path
+from typing import NoReturn
 
 from overwatch.github import GitHubClient, PullRequestRef, ReviewThread, parse_pr_url
 from overwatch.store import Store, default_db_path
@@ -33,6 +34,9 @@ def main() -> None:
     )
     parser.add_argument("--run-once", action="store_true", help="Check unresolved PRs once")
     parser.add_argument("--worker", action="store_true", help="Run the polling worker")
+    parser.add_argument("--serve", action="store_true", help="Run the FastAPI backend")
+    parser.add_argument("--host", default="127.0.0.1", help="Backend host for --serve")
+    parser.add_argument("--port", type=int, default=8000, help="Backend port for --serve")
     parser.add_argument("--interval", type=int, default=300, help="Worker interval in seconds")
     args = parser.parse_args()
 
@@ -44,6 +48,9 @@ def main() -> None:
         return
     if args.worker:
         run_forever(store, interval_seconds=args.interval)
+        return
+    if args.serve:
+        _serve_api(store, host=args.host, port=args.port)
         return
     if args.pr_link == "list":
         _print_watched_prs(store, include_inactive=args.all)
@@ -101,6 +108,15 @@ def _format_review_thread(thread: ReviewThread) -> str:
     if len(body) > 160:
         body = body[:157] + "..."
     return f"{thread.author}{location}: {body} {thread.url}".strip()
+
+
+def _serve_api(store: Store, *, host: str, port: int) -> NoReturn:
+    import uvicorn
+
+    from overwatch.api import create_app
+
+    uvicorn.run(create_app(store=store), host=host, port=port)
+    raise SystemExit(0)
 
 
 if __name__ == "__main__":
