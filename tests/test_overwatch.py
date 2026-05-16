@@ -7,6 +7,10 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
+from fastapi.testclient import TestClient
+
+from overwatch.api import create_app
+from overwatch.cli import _format_review_thread
 from overwatch.cli import _print_watched_prs
 from overwatch.github import (
     CiStatus,
@@ -461,6 +465,161 @@ class StoreTest(unittest.TestCase):
 
             self.assertEqual(store.watched_prs(), [])
             self.assertEqual(store.watched_prs(include_inactive=True)[0].status, "resolved")
+
+
+class ApiTest(unittest.TestCase):
+    def test_health_and_watch_list_get_pr(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = Store(Path(tmpdir) / "overwatch.sqlite3")
+            app = create_app(store=store, static_dir=Path(tmpdir) / "static")
+
+            with TestClient(app) as client:
+                health = client.get("/api/health")
+                created = client.post(
+                    "/api/prs",
+                    json={
+                        "url": "https://github.com/example/repo/pull/42",
+                        "provider": "codex",
+                        "model": "gpt-5.5",
+                        "autofix": True,
+                    },
+                )
+                listed = client.get("/api/prs")
+                fetched = client.get(f"/api/prs/{created.json()['id']}")
+
+            self.assertEqual(health.status_code, 200)
+            self.assertEqual(health.json(), {"status": "ok"})
+            self.assertEqual(created.status_code, 201)
+            self.assertEqual(created.json()["provider"], "codex")
+            self.assertTrue(created.json()["autofix"])
+            self.assertEqual(len(listed.json()), 1)
+            self.assertEqual(fetched.json()["url"], "https://github.com/example/repo/pull/42")
+
+    def test_pr_buckets_split_active_done_and_all(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = Store(Path(tmpdir) / "overwatch.sqlite3")
+            active = store.watch_pr(
+                parse_pr_url("https://github.com/example/repo/pull/42"),
+                provider="opencode",
+                model=None,
+                harness=None,
+            )
+            done = store.watch_pr(
+                parse_pr_url("https://github.com/example/repo/pull/43"),
+                provider="opencode",
+                model=None,
+                harness=None,
+            )
+            store.mark_inactive(done.id, status="merged")
+            app = create_app(store=store, static_dir=Path(tmpdir) / "static")
+
+            with TestClient(app) as client:
+                active_rows = client.get("/api/prs?bucket=active").json()
+                done_rows = client.get("/api/prs?bucket=done").json()
+                all_rows = client.get("/api/prs?bucket=all").json()
+
+            self.assertEqual([row["id"] for row in active_rows], [active.id])
+            self.assertEqual([row["id"] for row in done_rows], [done.id])
+            self.assertEqual({row["id"] for row in all_rows}, {active.id, done.id})
+
+    def test_events_include_ci_history_and_resolution_attempts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = Store(Path(tmpdir) / "overwatch.sqlite3")
+            watched = store.watch_pr(
+                parse_pr_url("https://github.com/example/repo/pull/42"),
+                provider="opencode",
+                model="gpt-5.5",
+                harness="full",
+            )
+            store.record_ci_status(
+                watched.id,
+                CiStatus(
+                    state="failure",
+                    head_sha="abc123",
+                    summary="tests failed",
+                    details={"jobs": ["test"]},
+                ),
+            )
+            attempt_id = store.start_attempt(watched, "abc123")
+            store.finish_attempt(attempt_id, status="failed", error="boom")
+            app = create_app(store=store, static_dir=Path(tmpdir) / "static")
+
+            with TestClient(app) as client:
+                response = client.get(f"/api/prs/{watched.id}/events")
+
+            self.assertEqual(response.status_code, 200)
+            events = response.json()
+            self.assertEqual(events["ci_history"][0]["state"], "failure")
+            self.assertEqual(events["ci_history"][0]["details"], {"jobs": ["test"]})
+            self.assertEqual(events["resolution_attempts"][0]["status"], "failed")
+            self.assertEqual(events["resolution_attempts"][0]["error"], "boom")
+
+    def test_refresh_records_single_github_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = Store(Path(tmpdir) / "overwatch.sqlite3")
+            watched = store.watch_pr(
+                parse_pr_url("https://github.com/example/repo/pull/42"),
+                provider="opencode",
+                model=None,
+                harness=None,
+            )
+            github = FakeGitHubClient(
+                CiStatus(
+                    state="success",
+                    head_sha="abc123",
+                    summary="tests passed",
+                    details={"source": "test"},
+                    merged=True,
+                )
+            )
+            app = create_app(
+                store=store,
+                github_factory=lambda: github,
+                static_dir=Path(tmpdir) / "static",
+            )
+
+            with TestClient(app) as client:
+                response = client.post(f"/api/prs/{watched.id}/refresh")
+
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json()["ci_status"]["head_sha"], "abc123")
+            self.assertEqual(response.json()["pr"]["status"], "merged")
+            self.assertEqual(store.watched_prs(), [])
+            self.assertEqual(len(github.checked), 1)
+
+    def test_static_assets_use_spa_fallback_and_reject_missing_api_route(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            static_dir = Path(tmpdir) / "static"
+            static_dir.mkdir()
+            (static_dir / "index.html").write_text("<main>app</main>", encoding="utf-8")
+            (static_dir / "app.js").write_text("console.log('ok')", encoding="utf-8")
+            app = create_app(store=Store(Path(tmpdir) / "overwatch.sqlite3"), static_dir=static_dir)
+
+            with TestClient(app) as client:
+                asset = client.get("/app.js")
+                fallback = client.get("/dashboard/prs")
+                api_missing = client.get("/api/missing")
+
+            self.assertEqual(asset.status_code, 200)
+            self.assertIn("console.log('ok')", asset.text)
+            self.assertEqual(fallback.status_code, 200)
+            self.assertIn("<main>app</main>", fallback.text)
+            self.assertEqual(api_missing.status_code, 404)
+
+    def test_app_uses_configured_db_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "configured.sqlite3"
+            with patch.dict("os.environ", {"OVERWATCH_DB": str(db_path)}):
+                app = create_app(static_dir=Path(tmpdir) / "static")
+
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/prs",
+                    json={"url": "https://github.com/example/repo/pull/42"},
+                )
+
+            self.assertEqual(response.status_code, 201)
+            self.assertTrue(db_path.exists())
 
 
 class WorkerTest(unittest.IsolatedAsyncioTestCase):

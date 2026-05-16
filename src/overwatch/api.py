@@ -1,0 +1,296 @@
+from __future__ import annotations
+
+import os
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Annotated, Any, Literal
+
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
+from fastapi.responses import FileResponse
+from pydantic import BaseModel, ConfigDict
+
+from overwatch.github import GitHubClient, PullRequestRef, parse_pr_url
+from overwatch.store import (
+    Store,
+    WatchedPullRequest,
+    WatchedPullRequestSummary,
+    default_db_path,
+)
+
+PrBucket = Literal["active", "done", "all"]
+
+DONE_STATUSES = frozenset({"resolved", "merged", "closed"})
+
+
+class HealthResponse(BaseModel):
+    status: Literal["ok"]
+
+
+class WatchPrRequest(BaseModel):
+    url: str
+    provider: str = "opencode"
+    model: str | None = None
+    harness: str | None = None
+    autofix: bool = False
+    merge_on_bot_approval: bool = False
+
+
+class PrResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    url: str
+    owner: str
+    repo: str
+    number: int
+    status: str
+    provider: str
+    model: str | None
+    harness: str | None
+    autofix: bool
+    merge_on_bot_approval: bool
+    created_at: str
+    updated_at: str
+    latest_ci_state: str | None = None
+    latest_head_sha: str | None = None
+    latest_summary: str | None = None
+    latest_checked_at: str | None = None
+
+
+class PrSummaryResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    url: str
+    owner: str
+    repo: str
+    number: int
+    status: str
+    provider: str
+    model: str | None
+    harness: str | None
+    autofix: bool
+    merge_on_bot_approval: bool
+    latest_ci_state: str | None
+    latest_head_sha: str | None
+    latest_summary: str | None
+    latest_checked_at: str | None
+
+
+class CiHistoryResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    head_sha: str
+    state: str
+    summary: str
+    details: dict[str, Any]
+    created_at: str
+
+
+class ResolutionAttemptResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    provider: str
+    model: str | None
+    harness: str | None
+    head_sha: str
+    status: str
+    error: str | None
+    created_at: str
+    completed_at: str | None
+
+
+class PrEventsResponse(BaseModel):
+    ci_history: list[CiHistoryResponse]
+    resolution_attempts: list[ResolutionAttemptResponse]
+
+
+class RefreshResponse(BaseModel):
+    pr: PrResponse
+    ci_status: CiHistoryResponse
+
+
+def default_static_dir() -> Path:
+    return Path(__file__).resolve().parent / "static"
+
+
+def configured_static_dir() -> Path:
+    configured = os.environ.get("OVERWATCH_STATIC_DIR")
+    return Path(configured).expanduser() if configured else default_static_dir()
+
+
+def configured_db_path() -> Path:
+    configured = os.environ.get("OVERWATCH_DB")
+    return Path(configured).expanduser() if configured else default_db_path()
+
+
+def _store(app: FastAPI) -> Store:
+    return app.state.store
+
+
+def _store_dependency(request: Request) -> Store:
+    return request.app.state.store
+
+
+def _github_dependency(request: Request) -> GitHubClient:
+    return request.app.state.github_factory()
+
+
+StoreDependency = Annotated[Store, Depends(_store_dependency)]
+GitHubDependency = Annotated[GitHubClient, Depends(_github_dependency)]
+
+
+def create_app(
+    *,
+    store: Store | None = None,
+    github_factory: Callable[[], GitHubClient] = GitHubClient,
+    static_dir: Path | None = None,
+) -> FastAPI:
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        _store(app).init()
+        yield
+
+    app = FastAPI(title="Overwatch API", lifespan=lifespan)
+    app.state.store = store or Store(configured_db_path())
+    app.state.github_factory = github_factory
+    app.state.static_dir = static_dir or configured_static_dir()
+
+    @app.get("/api/health", response_model=HealthResponse)
+    def health() -> HealthResponse:
+        return HealthResponse(status="ok")
+
+    @app.get("/api/prs", response_model=list[PrSummaryResponse])
+    def list_prs(
+        store: StoreDependency,
+        bucket: Annotated[PrBucket, Query()] = "active",
+    ) -> list[WatchedPullRequestSummary]:
+        rows = store.watched_prs(include_inactive=True)
+        if bucket == "active":
+            return [row for row in rows if row.status not in DONE_STATUSES]
+        if bucket == "done":
+            return [row for row in rows if row.status in DONE_STATUSES]
+        return rows
+
+    @app.get("/api/prs/{pr_id}", response_model=PrResponse)
+    def get_pr(pr_id: int, store: StoreDependency) -> PrResponse:
+        return _pr_response_or_404(store, pr_id)
+
+    @app.get("/api/prs/{pr_id}/events", response_model=PrEventsResponse)
+    def get_pr_events(pr_id: int, store: StoreDependency) -> PrEventsResponse:
+        _get_pr_or_404(store, pr_id)
+        ci_history, attempts = store.pr_events(pr_id)
+        return PrEventsResponse(
+            ci_history=[CiHistoryResponse.model_validate(event) for event in ci_history],
+            resolution_attempts=[
+                ResolutionAttemptResponse.model_validate(attempt) for attempt in attempts
+            ],
+        )
+
+    @app.post("/api/prs", response_model=PrResponse, status_code=status.HTTP_201_CREATED)
+    def watch_pr(
+        request: WatchPrRequest,
+        store: StoreDependency,
+    ) -> WatchedPullRequest:
+        try:
+            pr = parse_pr_url(request.url)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=str(exc),
+            ) from exc
+        watched = store.watch_pr(
+            pr,
+            provider=request.provider,
+            model=request.model,
+            harness=request.harness,
+            autofix=request.autofix,
+            merge_on_bot_approval=request.merge_on_bot_approval,
+        )
+        return PrResponse.model_validate(watched)
+
+    @app.post("/api/prs/{pr_id}/refresh", response_model=RefreshResponse)
+    def refresh_pr(
+        pr_id: int,
+        store: StoreDependency,
+        github: GitHubDependency,
+    ) -> RefreshResponse:
+        watched = _get_pr_or_404(store, pr_id)
+        pr_ref = PullRequestRef(
+            owner=watched.owner,
+            repo=watched.repo,
+            number=watched.number,
+            url=watched.url,
+        )
+        try:
+            ci_status = github.get_ci_status(pr_ref)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+        store.record_ci_status(watched.id, ci_status)
+        if ci_status.merged:
+            store.mark_inactive(watched.id, status="merged")
+        elif ci_status.pr_state == "closed":
+            store.mark_inactive(watched.id, status="closed")
+        ci_history, _attempts = store.pr_events(watched.id)
+        return RefreshResponse(
+            pr=_pr_response_or_404(store, pr_id),
+            ci_status=CiHistoryResponse.model_validate(ci_history[0]),
+        )
+
+    @app.get("/{path:path}", include_in_schema=False)
+    def serve_spa(path: str, request: Request) -> FileResponse:
+        if path.startswith("api/"):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+        return _static_response(request.app.state.static_dir, path)
+
+    return app
+
+def _get_pr_or_404(store: Store, pr_id: int) -> WatchedPullRequest:
+    watched = store.get_pr(pr_id)
+    if watched is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="PR not found")
+    return watched
+
+
+def _pr_response_or_404(store: Store, pr_id: int) -> PrResponse:
+    watched = _get_pr_or_404(store, pr_id)
+    latest = next(
+        (row for row in store.watched_prs(include_inactive=True) if row.id == pr_id),
+        None,
+    )
+    payload = PrResponse.model_validate(watched).model_dump()
+    if latest is not None:
+        payload.update(
+            {
+                "latest_ci_state": latest.latest_ci_state,
+                "latest_head_sha": latest.latest_head_sha,
+                "latest_summary": latest.latest_summary,
+                "latest_checked_at": latest.latest_checked_at,
+            }
+        )
+    return PrResponse.model_validate(payload)
+
+
+def _static_response(static_dir: Path, path: str) -> FileResponse:
+    root = static_dir.resolve()
+    index = root / "index.html"
+    candidate = (root / path).resolve()
+    if _is_relative_to(candidate, root) and candidate.is_file():
+        return FileResponse(candidate)
+    if index.is_file():
+        return FileResponse(index)
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Static assets not found")
+
+
+def _is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+app = create_app()
