@@ -12,6 +12,9 @@ from overwatch.github import CiStatus, PullRequestRef
 
 SESSION_STRATEGIES = frozenset({"fresh", "context-summary", "attached-session"})
 DEFAULT_SESSION_STRATEGY = "context-summary"
+DEFAULT_PROVIDER = "codex"
+DEFAULT_MODEL = "gpt-5.5"
+DEFAULT_WORKER_INTERVAL_SECONDS = 60
 DONE_STATUSES = frozenset({"resolved", "merged", "closed", "stopped"})
 CONTROL_STATUSES = frozenset({"unresolved", "paused", "stopped"})
 MAX_STORED_PROVIDER_OUTPUT_CHARS = 12_000
@@ -136,8 +139,8 @@ class Store:
                     repo text not null,
                     number integer not null,
                     status text not null default 'unresolved',
-                    provider text not null default 'opencode',
-                    model text,
+                    provider text not null default 'codex',
+                    model text default 'gpt-5.5',
                     harness text,
                     context_summary text not null default '',
                     session_strategy text not null default 'context-summary',

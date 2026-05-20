@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
+import subprocess
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -275,7 +277,7 @@ class GitHubClient:
         *,
         api_url: str = "https://api.github.com",
     ) -> None:
-        token = token or os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+        token = token or _github_token()
         self._transport = GitHubTransport(token, api_url)
         self.pull_requests = PullRequestGateway(self)
         self.ci = CiGateway(self)
@@ -389,6 +391,29 @@ class GitHubClient:
         if not isinstance(data, dict):
             raise RuntimeError("GitHub GraphQL response did not include data")
         return data
+
+
+def _github_token() -> str | None:
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if token:
+        return token
+    if not shutil.which("gh"):
+        return None
+    try:
+        result = subprocess.run(
+            ["gh", "auth", "token"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    token = result.stdout.strip()
+    if result.returncode != 0 or not token:
+        return None
+    return token
 
 
 def ci_status_from_snapshots(pr: PullRequestSnapshot, ci: CiSnapshot) -> CiStatus:

@@ -5,14 +5,14 @@ Overwatch watches GitHub pull requests, records CI state in SQLite, and invokes 
 ## Usage
 
 ```sh
-overwatch https://github.com/OWNER/REPO/pull/123 --provider codex --model gpt-5.5
+overwatch https://github.com/OWNER/REPO/pull/123
 overwatch https://github.com/OWNER/REPO/pull/123 --autofix --merge-on-bot-approval --turns 3
 overwatch https://github.com/OWNER/REPO/pull/123 --context-file ./overwatch-context.md --session-strategy context-summary
 overwatch --pause 1
 overwatch --resume 1
 overwatch --stop 1
 overwatch --run-once
-overwatch --worker --interval 300
+overwatch --worker
 ```
 
 Set `GITHUB_TOKEN` for private repositories or higher API limits.
@@ -23,6 +23,8 @@ Set `GITHUB_TOKEN` for private repositories or higher API limits.
 `--turns` sets the provider turn budget for a watched PR. It defaults to `3` and accepts values from `1` through `10`. Each provider launch consumes one turn. When more automated work is needed after the budget is used, Overwatch marks the PR `needs-human`.
 `--pause`, `--resume`, and `--stop` accept a watch database ID or exact PR URL. Paused and stopped watches are skipped by the worker before another provider turn starts. Paused watches remain visible in the active list; stopped watches are treated as terminal and show in `--all` or the API `done` bucket.
 `--merge-on-bot-approval` keeps watching the PR and, once CI is green and there are no unresolved review comments, merges it if the latest supported bot review/comment approves it. Today that supports Codex-authored text saying Codex did not find any major issues. If auto-fix completes while merge-on-bot-approval is enabled, Overwatch asks Codex to re-review.
+
+Overwatch defaults to the `codex` provider with model `gpt-5.5`, and the worker polls every 60 seconds unless `--interval` is set.
 
 Provider prompts explicitly tell agents to treat review comments as hypotheses, preserve the no-CI merge policy, explain invalid comments instead of making policy-breaking changes, and stop with a summary of blockers evaluated, changes made, tests run, commit/push status, and remaining human action. In `context-summary` and `attached-session` modes, prompts also include the stored durable context summary and prior provider turns.
 

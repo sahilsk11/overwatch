@@ -17,6 +17,7 @@ from overwatch.cli import (
     _print_watched_prs,
     _session_warning,
     _validate_session_options,
+    main,
 )
 from overwatch.domain import CiSnapshot, PullRequestSnapshot, ReviewSnapshot, ReviewSubmission
 from overwatch.github import (
@@ -26,6 +27,7 @@ from overwatch.github import (
     PullRequestRef,
     ReviewThread,
     _body_says_codex_approved,
+    _github_token,
     _is_codex_authored,
     _rollup_state,
     _summarize_status,
@@ -253,6 +255,40 @@ class CiStatusTest(unittest.TestCase):
 
 
 class GitHubClientTest(unittest.TestCase):
+    def test_github_token_prefers_environment(self) -> None:
+        with (
+            patch.dict("os.environ", {"GITHUB_TOKEN": "env-token", "GH_TOKEN": "gh-env-token"}),
+            patch("overwatch.github.subprocess.run") as run,
+        ):
+            self.assertEqual(_github_token(), "env-token")
+            run.assert_not_called()
+
+    def test_github_token_falls_back_to_gh_cli(self) -> None:
+        completed = type(
+            "Completed",
+            (),
+            {"returncode": 0, "stdout": "cli-token\n"},
+        )()
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch("overwatch.github.shutil.which", return_value="/usr/bin/gh"),
+            patch("overwatch.github.subprocess.run", return_value=completed),
+        ):
+            self.assertEqual(_github_token(), "cli-token")
+
+    def test_github_token_returns_none_when_gh_cli_fails(self) -> None:
+        completed = type(
+            "Completed",
+            (),
+            {"returncode": 1, "stdout": ""},
+        )()
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch("overwatch.github.shutil.which", return_value="/usr/bin/gh"),
+            patch("overwatch.github.subprocess.run", return_value=completed),
+        ):
+            self.assertIsNone(_github_token())
+
     def test_ci_snapshot_prefers_pr_rollup_and_preserves_source_errors(self) -> None:
         class SnapshotClient(GitHubClient):
             def _request(
@@ -537,6 +573,26 @@ class GitHubClientTest(unittest.TestCase):
 
 
 class CliTest(unittest.TestCase):
+    def test_watch_defaults_to_codex_gpt_5_5(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "overwatch.sqlite3"
+            argv = [
+                "overwatch",
+                "--db",
+                str(db_path),
+                "https://github.com/example/repo/pull/42",
+            ]
+            output = io.StringIO()
+
+            with patch.object(sys, "argv", argv), redirect_stdout(output):
+                main()
+
+            row = Store(db_path).watched_prs()[0]
+
+        self.assertEqual(row.provider, "codex")
+        self.assertEqual(row.model, "gpt-5.5")
+        self.assertIn("with codex", output.getvalue())
+
     def test_list_prints_comment_count_without_review_thread_details(self) -> None:
         class ListGitHubClient:
             def get_unresolved_review_threads(self, pr: PullRequestRef) -> list[ReviewThread]:
@@ -808,6 +864,21 @@ class ApiTest(unittest.TestCase):
             self.assertEqual(listed.json()[0]["max_turns"], 3)
             self.assertIsNone(listed.json()[0]["active_attempt_id"])
             self.assertEqual(fetched.json()["url"], "https://github.com/example/repo/pull/42")
+
+    def test_watch_api_defaults_to_codex_gpt_5_5(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = Store(Path(tmpdir) / "overwatch.sqlite3")
+            app = create_app(store=store, static_dir=Path(tmpdir) / "static")
+
+            with TestClient(app) as client:
+                created = client.post(
+                    "/api/prs",
+                    json={"url": "https://github.com/example/repo/pull/42"},
+                )
+
+            self.assertEqual(created.status_code, 201)
+            self.assertEqual(created.json()["provider"], "codex")
+            self.assertEqual(created.json()["model"], "gpt-5.5")
 
     def test_attached_session_api_requires_session_id(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

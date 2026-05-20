@@ -7,7 +7,15 @@ from pathlib import Path
 from typing import NoReturn
 
 from overwatch.github import GitHubClient, PullRequestRef, parse_pr_url
-from overwatch.store import DEFAULT_SESSION_STRATEGY, SESSION_STRATEGIES, Store, default_db_path
+from overwatch.store import (
+    DEFAULT_MODEL,
+    DEFAULT_PROVIDER,
+    DEFAULT_SESSION_STRATEGY,
+    DEFAULT_WORKER_INTERVAL_SECONDS,
+    SESSION_STRATEGIES,
+    Store,
+    default_db_path,
+)
 from overwatch.worker import run_forever, run_once
 
 
@@ -18,10 +26,14 @@ def main() -> None:
     parser.add_argument("--all", action="store_true", help="Include merged and closed PRs in list")
     parser.add_argument(
         "--provider",
-        default="opencode",
+        default=DEFAULT_PROVIDER,
         choices=["opencode", "codex", "claude-code"],
     )
-    parser.add_argument("--model", help="Model to pass to the coding agent")
+    parser.add_argument(
+        "--model",
+        default=DEFAULT_MODEL,
+        help="Model to pass to the coding agent",
+    )
     parser.add_argument("--harness", help="Harness name to pass to the coding agent")
     parser.add_argument(
         "--context",
@@ -74,7 +86,12 @@ def main() -> None:
     parser.add_argument("--stop", metavar="WATCH", help="Stop a watch by database ID or PR URL")
     parser.add_argument("--host", default="127.0.0.1", help="Backend host for --serve")
     parser.add_argument("--port", type=int, default=8000, help="Backend port for --serve")
-    parser.add_argument("--interval", type=int, default=300, help="Worker interval in seconds")
+    parser.add_argument(
+        "--interval",
+        type=int,
+        default=DEFAULT_WORKER_INTERVAL_SECONDS,
+        help="Worker interval in seconds",
+    )
     args = parser.parse_args()
 
     store = Store(args.db)

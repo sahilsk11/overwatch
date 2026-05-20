@@ -12,6 +12,8 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from overwatch.github import GitHubClient, PullRequestRef, parse_pr_url
 from overwatch.store import (
+    DEFAULT_MODEL,
+    DEFAULT_PROVIDER,
     DEFAULT_SESSION_STRATEGY,
     DONE_STATUSES,
     Store,
@@ -29,8 +31,8 @@ class HealthResponse(BaseModel):
 
 class WatchPrRequest(BaseModel):
     url: str
-    provider: str = "opencode"
-    model: str | None = None
+    provider: str = DEFAULT_PROVIDER
+    model: str | None = DEFAULT_MODEL
     harness: str | None = None
     context: str | None = None
     context_summary: str = ""
