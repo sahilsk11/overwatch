@@ -509,6 +509,34 @@ class GitHubClientTest(unittest.TestCase):
 
         self.assertTrue(decision.approved)
 
+    def test_request_codex_review_posts_head_marker_then_exact_trigger(self) -> None:
+        class RequestClient(GitHubClient):
+            def __init__(self) -> None:
+                super().__init__(token="token")
+                self.comments: list[str] = []
+
+            def _request(
+                self,
+                path: str,
+                *,
+                method: str = "GET",
+                data: dict[str, object] | None = None,
+            ) -> dict[str, object]:
+                self.comments.append(str((data or {}).get("body") or ""))
+                return {}
+
+        client = RequestClient()
+
+        client.request_codex_review(
+            PullRequestRef("example", "repo", 42, "https://github.com/example/repo/pull/42"),
+            "current-sha",
+        )
+
+        self.assertEqual(
+            client.comments,
+            ["@codex review\n\nHead SHA: current-sha", "@codex review"],
+        )
+
     def test_codex_review_decision_accepts_issue_comment_after_unbound_manual_request_without_head(
         self,
     ) -> None:

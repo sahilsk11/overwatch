@@ -317,10 +317,9 @@ class GitHubClient:
         self.pull_requests.merge(pr, head_sha)
 
     def request_codex_review(self, pr: PullRequestRef, head_sha: str | None = None) -> None:
-        body = "@codex review"
         if head_sha:
-            body = f"{body}\n\nHead SHA: {head_sha}"
-        self.pull_requests.create_issue_comment(pr, body)
+            self.pull_requests.create_issue_comment(pr, f"@codex review\n\nHead SHA: {head_sha}")
+        self.pull_requests.create_issue_comment(pr, "@codex review")
 
     def get_unresolved_review_threads(self, pr: PullRequestRef) -> list[ReviewThread]:
         return self.reviews.get_unresolved_review_threads(pr)
