@@ -232,6 +232,105 @@ class StoreTest(unittest.TestCase):
         self.assertEqual(turns[0].status, "failed")
         self.assertEqual(turns[0].error, "stale processing recovered")
 
+    def test_recover_stale_processing_ignores_resolution_attempt_turns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = Store(Path(tmpdir) / "overwatch.sqlite3")
+            watched = store.watch_pr(
+                parse_pr_url("https://github.com/example/repo/pull/42"),
+                provider="codex",
+                model="gpt-5.5",
+                harness=None,
+            )
+            store.start_attempt(watched, "head-sha")
+            old_timestamp = "2000-01-01T00:00:00+00:00"
+            with store.connect() as conn:
+                conn.execute(
+                    """
+                    update watch_turns
+                    set created_at = ?
+                    where watched_pr_id = ?
+                    """,
+                    (old_timestamp, watched.id),
+                )
+
+            recovered = store.recover_stale_processing(older_than_seconds=1)
+            refreshed = store.get_pr(watched.id)
+            _, attempts, turns = store.pr_events(watched.id)
+
+        self.assertEqual(recovered, 0)
+        self.assertIsNotNone(refreshed)
+        assert refreshed is not None
+        self.assertEqual(refreshed.status, "unresolved")
+        self.assertEqual(attempts[0].status, "running")
+        self.assertEqual(turns[0].status, "running")
+        self.assertIsNone(turns[0].error)
+
+    def test_watched_prs_reports_latest_diagnostics_by_event_recency(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = Store(Path(tmpdir) / "overwatch.sqlite3")
+            watched = store.watch_pr(
+                parse_pr_url("https://github.com/example/repo/pull/42"),
+                provider="codex",
+                model="gpt-5.5",
+                harness=None,
+                max_turns=2,
+            )
+            attempt_id = store.start_attempt(watched, "head-sha")
+            store.finish_attempt(
+                attempt_id,
+                status="failed",
+                provider_command="codex old",
+                provider_output="old attempt output",
+                error="old attempt error",
+            )
+            with store.connect() as conn:
+                conn.execute(
+                    """
+                    update resolution_attempts
+                    set completed_at = '2000-01-01T00:00:00+00:00'
+                    where id = ?
+                    """,
+                    (attempt_id,),
+                )
+                conn.execute(
+                    """
+                    update watch_turns
+                    set completed_at = '2000-01-01T00:00:00+00:00'
+                    where id = (
+                        select watch_turn_id
+                        from resolution_attempts
+                        where id = ?
+                    )
+                    """,
+                    (attempt_id,),
+                )
+            claimed = store.claim_supervisor_turn(provider="codex", model="gpt-5.5")
+            assert claimed is not None
+            _, turn = claimed
+            store.finish_supervisor_turn(
+                turn.id,
+                status="failed",
+                provider_command="codex new",
+                provider_output="new supervisor output",
+                error="new supervisor error",
+            )
+            with store.connect() as conn:
+                conn.execute(
+                    """
+                    update watch_turns
+                    set completed_at = '2001-01-01T00:00:00+00:00'
+                    where id = ?
+                    """,
+                    (turn.id,),
+                )
+
+            listed = store.watched_prs(include_inactive=True)
+
+        self.assertEqual(listed[0].last_attempt_status, "failed")
+        self.assertEqual(listed[0].last_provider_command, "codex new")
+        self.assertEqual(listed[0].last_provider_output, "new supervisor output")
+        self.assertEqual(listed[0].last_error, "new supervisor error")
+
 
 class CliTest(unittest.TestCase):
     def test_cli_adds_and_lists_watch(self) -> None:

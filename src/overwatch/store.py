@@ -344,20 +344,11 @@ class Store:
                         running_turn.created_at
                     ) as active_attempt_started_at,
                     coalesce(running.status, running_turn.status) as active_attempt_status,
-                    coalesce(last_attempt.status, last_turn.status) as last_attempt_status,
-                    coalesce(
-                        last_attempt.completed_at,
-                        last_turn.completed_at
-                    ) as last_attempt_completed_at,
-                    coalesce(
-                        last_attempt.provider_command,
-                        last_turn.provider_command
-                    ) as last_provider_command,
-                    coalesce(
-                        last_attempt.provider_output,
-                        last_turn.provider_output
-                    ) as last_provider_output,
-                    coalesce(last_attempt.error, last_turn.error) as last_error
+                    last_event.status as last_attempt_status,
+                    last_event.completed_at as last_attempt_completed_at,
+                    last_event.provider_command as last_provider_command,
+                    last_event.provider_output as last_provider_output,
+                    last_event.error as last_error
                 from watched_prs
                 left join ci_check_history latest
                     on latest.id = (
@@ -373,12 +364,6 @@ class Store:
                         order by created_at desc, id desc
                         limit 1
                     )
-                left join resolution_attempts last_attempt
-                    on last_attempt.id = (
-                        select max(id)
-                        from resolution_attempts
-                        where watched_pr_id = watched_prs.id
-                    )
                 left join watch_turns running_turn
                     on running_turn.id = (
                         select id
@@ -387,12 +372,47 @@ class Store:
                         order by created_at desc, id desc
                         limit 1
                     )
-                left join watch_turns last_turn
-                    on last_turn.id = (
-                        select max(id)
-                        from watch_turns
-                        where watched_pr_id = watched_prs.id
+                left join (
+                    select *
+                    from (
+                        select
+                            events.*,
+                            row_number() over (
+                                partition by events.watched_pr_id
+                                order by
+                                    events.event_at desc,
+                                    events.source_rank desc,
+                                    events.id desc
+                            ) as rank
+                        from (
+                            select
+                                id,
+                                watched_pr_id,
+                                status,
+                                completed_at,
+                                provider_command,
+                                provider_output,
+                                error,
+                                coalesce(completed_at, created_at) as event_at,
+                                0 as source_rank
+                            from resolution_attempts
+                            union all
+                            select
+                                id,
+                                watched_pr_id,
+                                status,
+                                completed_at,
+                                provider_command,
+                                provider_output,
+                                error,
+                                coalesce(completed_at, created_at) as event_at,
+                                1 as source_rank
+                            from watch_turns
+                        ) events
                     )
+                    where rank = 1
+                ) last_event
+                    on last_event.watched_pr_id = watched_prs.id
                 {where}
                 order by watched_prs.created_at desc, watched_prs.id desc
                 """
@@ -659,7 +679,14 @@ class Store:
                 """
                 select id, watched_pr_id
                 from watch_turns
-                where status = 'running' and created_at < ?
+                where status = 'running'
+                    and starting_head_sha = 'supervisor-tick'
+                    and watched_pr_id in (
+                        select id
+                        from watched_prs
+                        where status = 'processing'
+                    )
+                    and created_at < ?
                 """,
                 (cutoff,),
             ).fetchall()
