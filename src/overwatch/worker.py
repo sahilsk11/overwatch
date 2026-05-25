@@ -150,7 +150,7 @@ def prune_inactive_watches(store: Store, *, github: object) -> None:
         )
         try:
             snapshot = github.get_pr_snapshot(pr)
-        except RuntimeError:
+        except (RuntimeError, OSError):
             continue
         if snapshot.merged:
             store.mark_inactive(watch.id, status="merged")

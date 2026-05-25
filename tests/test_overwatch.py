@@ -52,6 +52,11 @@ class FakeGitHub:
         )
 
 
+class FailingGitHub:
+    def get_pr_snapshot(self, pr: PullRequestRef) -> PullRequestSnapshot:
+        raise OSError("network unavailable")
+
+
 class StoreTest(unittest.TestCase):
     def test_add_list_pause_resume_stop_watch(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -312,6 +317,26 @@ class WorkerTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("https://github.com/example/repo/pull/43", provider.calls[0][0])
         self.assertNotIn("https://github.com/example/repo/pull/41", provider.calls[0][0])
         self.assertNotIn("https://github.com/example/repo/pull/42", provider.calls[0][0])
+
+    async def test_run_tick_continues_when_pruning_snapshot_lookup_has_network_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = Store(Path(tmpdir) / "overwatch.sqlite3")
+            watched = store.watch_pr(
+                parse_pr_url("https://github.com/example/repo/pull/42"),
+                provider="codex",
+                model="gpt-5.5",
+                harness=None,
+            )
+            provider = FakeProvider()
+
+            await run_tick(store, github=FailingGitHub(), registry=ProviderRegistry([provider]))
+            refreshed = store.get_pr(watched.id)
+
+        self.assertIsNotNone(refreshed)
+        assert refreshed is not None
+        self.assertEqual(refreshed.status, "unresolved")
+        self.assertEqual(refreshed.turns_used, 1)
+        self.assertEqual(len(provider.calls), 1)
 
     def test_supervisor_prompt_is_cron_friendly(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
