@@ -46,6 +46,8 @@ interface PullRequestSummary {
   merge_on_bot_approval?: boolean;
   max_turns?: number;
   turns_used?: number;
+  created_at?: string | null;
+  updated_at?: string | null;
   latest_ci_state?: string | null;
   latest_head_sha?: string | null;
   latest_summary?: string | null;
@@ -62,10 +64,7 @@ interface PullRequestSummary {
   last_error?: string | null;
 }
 
-interface PullRequestDetail extends PullRequestSummary {
-  created_at?: string | null;
-  updated_at?: string | null;
-}
+interface PullRequestDetail extends PullRequestSummary {}
 
 interface CiHistoryEvent {
   id: string | number;
@@ -113,9 +112,9 @@ interface Loadable<T> {
 }
 
 const bucketLabels: Record<Bucket, string> = {
-  active: "Tracked PRs",
-  done: "Done / Merged / Closed",
-  all: "All",
+  active: "Active",
+  done: "Done",
+  all: "All Watches",
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -341,7 +340,7 @@ function App() {
     const needle = query.trim().toLowerCase();
     if (!needle) return prs.data;
     return prs.data.filter((pr) =>
-      [prLabel(pr), pr.url, pr.status, pr.latest_ci_state, pr.latest_summary]
+      [prLabel(pr), pr.url, pr.status, pr.latest_ci_state, pr.latest_summary, pr.created_at]
         .filter(Boolean)
         .some((value) => String(value).toLowerCase().includes(needle)),
     );
@@ -351,8 +350,8 @@ function App() {
     <main className="shell">
       <header className="topbar">
         <div>
-          <div className="eyebrow">Overwatch Control</div>
-          <h1>Pull Request Operations</h1>
+          <div className="eyebrow">Overwatch</div>
+          <h1>Watched Pull Requests</h1>
         </div>
         <div className={`health health-${health}`}>
           {health === "checking" ? <Loader2 className="spin" /> : health === "ok" ? <Check /> : <X />}
@@ -392,7 +391,7 @@ function App() {
           {prs.error ? <ErrorState message={prs.error} onRetry={loadPrs} /> : null}
           {prs.loading ? <LoadingRows /> : null}
           {!prs.loading && !prs.error && filteredPrs.length === 0 ? (
-            <EmptyState title="No pull requests" detail="Tracked PRs will appear here after one is added." />
+            <EmptyState title="No watched PRs" detail="There are no stored watches in this view." />
           ) : null}
           <div className="pr-list">
             {filteredPrs.map((pr) => (
@@ -408,9 +407,9 @@ function App() {
                     {prLabel(pr)}
                   </span>
                   <span className="pr-subtitle">{pr.latest_summary || pr.url}</span>
+                  <span className="pr-added">Added {formatDate(pr.created_at)}</span>
                 </span>
                 <span className="pr-meta">
-                  <StatusPill value={pr.latest_ci_state ?? pr.status} />
                   <ChevronRight aria-hidden="true" />
                 </span>
               </button>
@@ -443,7 +442,7 @@ function DetailPanel({
   if (selectedId === null) {
     return (
       <section className="detail-panel">
-        <EmptyState title="Select a PR" detail="Status, event, and agent logs will load in this pane." />
+        <EmptyState title="Select a watch" detail="Status, events, and agent logs will load in this pane." />
       </section>
     );
   }
@@ -480,7 +479,7 @@ function DetailPanel({
     <section className="detail-panel">
       <div className="detail-header">
         <div>
-          <div className="eyebrow">PR Detail</div>
+          <div className="eyebrow">Watch Detail</div>
           <h2>{prLabel(pr)}</h2>
           <a href={pr.url} target="_blank" rel="noreferrer">
             {pr.url}

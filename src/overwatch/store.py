@@ -65,6 +65,8 @@ class WatchedPullRequestSummary:
     merge_on_bot_approval: bool
     max_turns: int
     turns_used: int
+    created_at: str
+    updated_at: str
     latest_ci_state: str | None
     latest_head_sha: str | None
     latest_summary: str | None
@@ -307,6 +309,8 @@ class Store:
                     watched_prs.merge_on_bot_approval,
                     watched_prs.max_turns,
                     watched_prs.turns_used,
+                    watched_prs.created_at,
+                    watched_prs.updated_at,
                     latest.state as latest_ci_state,
                     latest.head_sha as latest_head_sha,
                     latest.summary as latest_summary,
@@ -341,7 +345,7 @@ class Store:
                         where watched_pr_id = watched_prs.id
                     )
                 {where}
-                order by watched_prs.created_at
+                order by watched_prs.created_at desc, watched_prs.id desc
                 """
             ).fetchall()
         return [_watched_pr_summary(row) for row in rows]
