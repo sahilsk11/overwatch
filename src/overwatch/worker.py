@@ -5,7 +5,13 @@ import shlex
 from dataclasses import dataclass
 
 from overwatch.github import GitHubClient, PullRequestRef
-from overwatch.providers import AgentConfig, ProviderRegistry, default_registry
+from overwatch.providers import (
+    AgentConfig,
+    ProviderRegistry,
+    ProviderRunError,
+    ProviderRunResult,
+    default_registry,
+)
 from overwatch.store import (
     DEFAULT_MODEL,
     DEFAULT_PROVIDER,
@@ -13,6 +19,8 @@ from overwatch.store import (
     WatchedPullRequest,
     WatchTurnEvent,
 )
+
+STALE_PROCESSING_SECONDS = 60 * 60
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,24 +39,35 @@ async def run_tick(
     max_attempts_per_sha: int | None = None,
 ) -> None:
     _ = max_attempts_per_sha
+    provider_id = provider_id or DEFAULT_PROVIDER
+    model = model if model is not None else DEFAULT_MODEL
     github = github or GitHubClient()
+    store.init()
     prune_inactive_watches(store, github=github)
-    watches = _claim_runnable_watches(store)
+    store.recover_stale_processing(older_than_seconds=STALE_PROCESSING_SECONDS)
+    watches = _claim_runnable_watches(store, provider=provider_id, model=model)
     if not watches:
         return
     registry = registry or default_registry()
-    provider_id = provider_id or DEFAULT_PROVIDER
-    model = model if model is not None else DEFAULT_MODEL
     try:
         provider = registry.get(provider_id)
-        await provider.run(
+        result = await provider.run(
             build_supervisor_prompt(store, [claimed.watch for claimed in watches]),
             AgentConfig(provider=provider_id, model=model),
         )
-    except Exception:
-        _finish_claimed_turns(store, watches, status="failed")
+    except ProviderRunError as exc:
+        _finish_claimed_turns(
+            store,
+            watches,
+            status="failed",
+            provider_result=exc.result,
+            error=str(exc),
+        )
         return
-    _finish_claimed_turns(store, watches, status="completed")
+    except Exception as exc:
+        _finish_claimed_turns(store, watches, status="failed", error=str(exc))
+        return
+    _finish_claimed_turns(store, watches, status="completed", provider_result=result)
 
 
 def run_forever(store: Store, *, interval_seconds: int = 300) -> None:
@@ -158,21 +177,32 @@ def prune_inactive_watches(store: Store, *, github: object) -> None:
             store.mark_inactive(watch.id, status="closed")
 
 
-def _claim_runnable_watches(store: Store) -> list[ClaimedWatch]:
+def _claim_runnable_watches(
+    store: Store,
+    *,
+    provider: str,
+    model: str | None,
+) -> list[ClaimedWatch]:
     claimed: list[ClaimedWatch] = []
-    for watch in store.unresolved_prs():
-        if watch.turns_used >= watch.max_turns:
-            store.mark_needs_human(watch.id)
-            continue
-        try:
-            turn = store.start_supervisor_turn(watch)
-        except RuntimeError:
-            continue
-        refreshed = store.get_pr(watch.id)
-        claimed.append(ClaimedWatch(watch=refreshed or watch, turn=turn))
+    while claim := store.claim_supervisor_turn(provider=provider, model=model):
+        watch, turn = claim
+        claimed.append(ClaimedWatch(watch=watch, turn=turn))
     return claimed
 
 
-def _finish_claimed_turns(store: Store, watches: list[ClaimedWatch], *, status: str) -> None:
+def _finish_claimed_turns(
+    store: Store,
+    watches: list[ClaimedWatch],
+    *,
+    status: str,
+    provider_result: ProviderRunResult | None = None,
+    error: str | None = None,
+) -> None:
     for claimed in watches:
-        store.finish_supervisor_turn(claimed.turn.id, status=status)
+        store.finish_supervisor_turn(
+            claimed.turn.id,
+            status=status,
+            provider_command=provider_result.command if provider_result else None,
+            provider_output=provider_result.output if provider_result else None,
+            error=error,
+        )

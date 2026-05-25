@@ -15,6 +15,7 @@ from overwatch.store import (
     Store,
     WatchedPullRequest,
     WatchedPullRequestSummary,
+    WatchTurnEvent,
     default_db_path,
 )
 
@@ -127,9 +128,26 @@ class ResolutionAttemptResponse(BaseModel):
     completed_at: str | None
 
 
+class WatchTurnResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    turn_number: int
+    starting_head_sha: str
+    status: str
+    created_at: str
+    completed_at: str | None
+    provider: str | None
+    model: str | None
+    provider_command: str | None
+    provider_output: str | None
+    error: str | None
+
+
 class PrEventsResponse(BaseModel):
     ci_history: list[CiHistoryResponse]
     resolution_attempts: list[ResolutionAttemptResponse]
+    watch_turns: list[WatchTurnResponse]
 
 
 def default_static_dir() -> Path:
@@ -194,12 +212,13 @@ def create_app(
     @app.get("/api/prs/{pr_id}/events", response_model=PrEventsResponse)
     def get_pr_events(pr_id: int, store: StoreDependency) -> PrEventsResponse:
         _get_pr_or_404(store, pr_id)
-        ci_history, attempts = store.pr_events(pr_id)
+        ci_history, attempts, turns = store.pr_events(pr_id)
         return PrEventsResponse(
             ci_history=[CiHistoryResponse.model_validate(event) for event in ci_history],
             resolution_attempts=[
                 ResolutionAttemptResponse.model_validate(attempt) for attempt in attempts
             ],
+            watch_turns=[_watch_turn_response(turn) for turn in turns],
         )
 
     @app.get("/{path:path}", include_in_schema=False)
@@ -244,6 +263,10 @@ def _pr_response_or_404(store: Store, pr_id: int) -> PrResponse:
             }
         )
     return PrResponse.model_validate(payload)
+
+
+def _watch_turn_response(turn: WatchTurnEvent) -> WatchTurnResponse:
+    return WatchTurnResponse.model_validate(turn)
 
 
 def _static_response(static_dir: Path, path: str) -> FileResponse:

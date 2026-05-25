@@ -91,6 +91,20 @@ interface ResolutionAttempt {
   error?: string | null;
 }
 
+interface WatchTurn {
+  id?: string | number;
+  turn_number?: number | null;
+  starting_head_sha?: string | null;
+  status?: string | null;
+  provider?: string | null;
+  model?: string | null;
+  provider_command?: string | null;
+  provider_output?: string | null;
+  created_at?: string | null;
+  completed_at?: string | null;
+  error?: string | null;
+}
+
 interface PrEvent {
   id?: string | number;
   type?: string;
@@ -103,6 +117,7 @@ interface PrEvent {
 interface PrEventsPayload {
   ci_history?: CiHistoryEvent[];
   resolution_attempts?: ResolutionAttempt[];
+  watch_turns?: WatchTurn[];
 }
 
 interface Loadable<T> {
@@ -192,6 +207,25 @@ async function fetchPrEvents(id: string | number): Promise<PrEvent[]> {
           .join(" "),
         created_at: attempt.completed_at ?? attempt.created_at,
         payload: attempt,
+      })),
+      ...asArray<WatchTurn>(typed.watch_turns).map((turn) => ({
+        id: `turn-${turn.id}`,
+        type: "supervisor",
+        level: turn.status ?? undefined,
+        message: [
+          turn.provider || "supervisor",
+          turn.turn_number ? `turn ${turn.turn_number}` : null,
+          turn.model,
+          turn.starting_head_sha && turn.starting_head_sha !== "supervisor-tick"
+            ? `@ ${turn.starting_head_sha.slice(0, 8)}`
+            : null,
+          turn.status,
+          turn.error,
+        ]
+          .filter(Boolean)
+          .join(" "),
+        created_at: turn.completed_at ?? turn.created_at,
+        payload: turn,
       })),
     ];
   }
@@ -593,13 +627,13 @@ function elapsedLabel(seconds?: number | null): string {
 
 function collectLogs(pr: PullRequestDetail, events: PrEvent[]): string {
   const providerLogs = events
-    .map((event) => (isRecord(event.payload) ? (event.payload as ResolutionAttempt) : null))
+    .map((event) => (isRecord(event.payload) ? (event.payload as ResolutionAttempt | WatchTurn) : null))
     .filter(Boolean)
-    .flatMap((attempt) => [
-      attempt?.turn_number ? `turn ${attempt.turn_number}` : null,
-      attempt?.provider_command ? `$ ${attempt.provider_command}` : null,
-      attempt?.provider_output ?? null,
-      attempt?.error ? `error: ${attempt.error}` : null,
+    .flatMap((entry) => [
+      entry?.turn_number ? `turn ${entry.turn_number}` : null,
+      entry?.provider_command ? `$ ${entry.provider_command}` : null,
+      entry?.provider_output ?? null,
+      entry?.error ? `error: ${entry.error}` : null,
     ]);
   const logs = [
     pr.latest_summary,

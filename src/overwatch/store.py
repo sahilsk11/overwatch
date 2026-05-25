@@ -4,7 +4,7 @@ import json
 import sqlite3
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +16,7 @@ DEFAULT_PROVIDER = "codex"
 DEFAULT_MODEL = "gpt-5.5"
 DEFAULT_WORKER_INTERVAL_SECONDS = 60
 DONE_STATUSES = frozenset({"resolved", "merged", "closed", "stopped"})
-CONTROL_STATUSES = frozenset({"unresolved", "paused", "stopped"})
+CONTROL_STATUSES = frozenset({"unresolved", "processing", "paused", "stopped"})
 MAX_STORED_PROVIDER_OUTPUT_CHARS = 12_000
 MAX_STORED_PROVIDER_ERROR_CHARS = 4_000
 
@@ -118,6 +118,11 @@ class WatchTurnEvent:
     status: str
     created_at: str
     completed_at: str | None
+    provider: str | None = None
+    model: str | None = None
+    provider_command: str | None = None
+    provider_output: str | None = None
+    error: str | None = None
 
 
 class Store:
@@ -182,6 +187,11 @@ class Store:
                     turn_number integer not null,
                     starting_head_sha text not null,
                     status text not null,
+                    provider text,
+                    model text,
+                    provider_command text,
+                    provider_output text,
+                    error text,
                     created_at text not null,
                     completed_at text
                 );
@@ -207,6 +217,11 @@ class Store:
             _ensure_column(conn, "resolution_attempts", "watch_turn_id", "integer")
             _ensure_column(conn, "resolution_attempts", "provider_command", "text")
             _ensure_column(conn, "resolution_attempts", "provider_output", "text")
+            _ensure_column(conn, "watch_turns", "provider", "text")
+            _ensure_column(conn, "watch_turns", "model", "text")
+            _ensure_column(conn, "watch_turns", "provider_command", "text")
+            _ensure_column(conn, "watch_turns", "provider_output", "text")
+            _ensure_column(conn, "watch_turns", "error", "text")
 
     def watch_pr(
         self,
@@ -279,6 +294,14 @@ class Store:
             ).fetchall()
         return [_watched_pr(row) for row in rows]
 
+    def processing_prs(self) -> list[WatchedPullRequest]:
+        self.init()
+        with self.connect() as conn:
+            rows = conn.execute(
+                "select * from watched_prs where status = 'processing' order by updated_at"
+            ).fetchall()
+        return [_watched_pr(row) for row in rows]
+
     def get_pr(self, pr_id: int) -> WatchedPullRequest | None:
         self.init()
         with self.connect() as conn:
@@ -315,14 +338,17 @@ class Store:
                     latest.head_sha as latest_head_sha,
                     latest.summary as latest_summary,
                     latest.created_at as latest_checked_at,
-                    running.id as active_attempt_id,
-                    running.created_at as active_attempt_started_at,
-                    running.status as active_attempt_status,
-                    last_attempt.status as last_attempt_status,
-                    last_attempt.completed_at as last_attempt_completed_at,
-                    last_attempt.provider_command as last_provider_command,
-                    last_attempt.provider_output as last_provider_output,
-                    last_attempt.error as last_error
+                    coalesce(running.id, running_turn.id) as active_attempt_id,
+                    coalesce(
+                        running.created_at,
+                        running_turn.created_at
+                    ) as active_attempt_started_at,
+                    coalesce(running.status, running_turn.status) as active_attempt_status,
+                    last_event.status as last_attempt_status,
+                    last_event.completed_at as last_attempt_completed_at,
+                    last_event.provider_command as last_provider_command,
+                    last_event.provider_output as last_provider_output,
+                    last_event.error as last_error
                 from watched_prs
                 left join ci_check_history latest
                     on latest.id = (
@@ -338,12 +364,55 @@ class Store:
                         order by created_at desc, id desc
                         limit 1
                     )
-                left join resolution_attempts last_attempt
-                    on last_attempt.id = (
-                        select max(id)
-                        from resolution_attempts
-                        where watched_pr_id = watched_prs.id
+                left join watch_turns running_turn
+                    on running_turn.id = (
+                        select id
+                        from watch_turns
+                        where watched_pr_id = watched_prs.id and status = 'running'
+                        order by created_at desc, id desc
+                        limit 1
                     )
+                left join (
+                    select *
+                    from (
+                        select
+                            events.*,
+                            row_number() over (
+                                partition by events.watched_pr_id
+                                order by
+                                    events.event_at desc,
+                                    events.source_rank desc,
+                                    events.id desc
+                            ) as rank
+                        from (
+                            select
+                                id,
+                                watched_pr_id,
+                                status,
+                                completed_at,
+                                provider_command,
+                                provider_output,
+                                error,
+                                coalesce(completed_at, created_at) as event_at,
+                                0 as source_rank
+                            from resolution_attempts
+                            union all
+                            select
+                                id,
+                                watched_pr_id,
+                                status,
+                                completed_at,
+                                provider_command,
+                                provider_output,
+                                error,
+                                coalesce(completed_at, created_at) as event_at,
+                                1 as source_rank
+                            from watch_turns
+                        ) events
+                    )
+                    where rank = 1
+                ) last_event
+                    on last_event.watched_pr_id = watched_prs.id
                 {where}
                 order by watched_prs.created_at desc, watched_prs.id desc
                 """
@@ -368,7 +437,10 @@ class Store:
                 ),
             )
 
-    def pr_events(self, pr_id: int) -> tuple[list[CiHistoryEvent], list[ResolutionAttemptEvent]]:
+    def pr_events(
+        self,
+        pr_id: int,
+    ) -> tuple[list[CiHistoryEvent], list[ResolutionAttemptEvent], list[WatchTurnEvent]]:
         self.init()
         with self.connect() as conn:
             ci_rows = conn.execute(
@@ -403,9 +475,30 @@ class Store:
                 """,
                 (pr_id,),
             ).fetchall()
+            turn_rows = conn.execute(
+                """
+                select
+                    id,
+                    turn_number,
+                    starting_head_sha,
+                    status,
+                    created_at,
+                    completed_at,
+                    provider,
+                    model,
+                    provider_command,
+                    provider_output,
+                    error
+                from watch_turns
+                where watched_pr_id = ?
+                order by created_at desc, id desc
+                """,
+                (pr_id,),
+            ).fetchall()
         return (
             [_ci_history_event(row) for row in ci_rows],
             [_resolution_attempt_event(row) for row in attempt_rows],
+            [_watch_turn_event(row) for row in turn_rows],
         )
 
     def watch_turns(self, pr_id: int) -> list[WatchTurnEvent]:
@@ -413,7 +506,18 @@ class Store:
         with self.connect() as conn:
             rows = conn.execute(
                 """
-                select id, turn_number, starting_head_sha, status, created_at, completed_at
+                select
+                    id,
+                    turn_number,
+                    starting_head_sha,
+                    status,
+                    created_at,
+                    completed_at,
+                    provider,
+                    model,
+                    provider_command,
+                    provider_output,
+                    error
                 from watch_turns
                 where watched_pr_id = ?
                 order by turn_number desc, id desc
@@ -485,8 +589,29 @@ class Store:
             )
             return int(cursor.lastrowid)
 
-    def start_supervisor_turn(self, pr: WatchedPullRequest) -> WatchTurnEvent:
+    def claim_supervisor_turn(
+        self,
+        *,
+        provider: str = DEFAULT_PROVIDER,
+        model: str | None = DEFAULT_MODEL,
+    ) -> tuple[WatchedPullRequest, WatchTurnEvent] | None:
+        self.init()
         with self.connect() as conn:
+            conn.execute("begin immediate")
+            return self._claim_supervisor_turn(conn, provider=provider, model=model)
+
+    def start_supervisor_turn(self, pr: WatchedPullRequest) -> WatchTurnEvent:
+        self.init()
+        with self.connect() as conn:
+            conn.execute("begin immediate")
+            claimed = self._claim_supervisor_turn(
+                conn,
+                pr_id=pr.id,
+                provider=DEFAULT_PROVIDER,
+                model=DEFAULT_MODEL,
+            )
+            if claimed is not None:
+                return claimed[1]
             row = conn.execute(
                 "select status, max_turns, turns_used from watched_prs where id = ?",
                 (pr.id,),
@@ -495,48 +620,190 @@ class Store:
                 raise ValueError(f"watched PR {pr.id} does not exist")
             if str(row["status"]) != "unresolved":
                 raise RuntimeError(f"watch is {row['status']}")
-            turns_used = int(row["turns_used"])
-            max_turns = int(row["max_turns"])
-            if turns_used >= max_turns:
+            if int(row["turns_used"]) >= int(row["max_turns"]):
                 raise RuntimeError("turn budget exhausted")
-            turn_number = turns_used + 1
+
+    def finish_supervisor_turn(
+        self,
+        turn_id: int,
+        *,
+        status: str,
+        provider_command: str | None = None,
+        provider_output: str | None = None,
+        error: str | None = None,
+    ) -> None:
+        with self.connect() as conn:
             now = _now()
             conn.execute(
                 """
-                update watched_prs
-                set turns_used = ?, updated_at = ?
+                update watch_turns
+                set status = ?,
+                    provider_command = coalesce(?, provider_command),
+                    provider_output = coalesce(?, provider_output),
+                    error = ?,
+                    completed_at = ?
                 where id = ?
                 """,
-                (turn_number, now, pr.id),
+                (
+                    status,
+                    _truncate_nullable(provider_command, MAX_STORED_PROVIDER_ERROR_CHARS),
+                    _truncate_nullable(provider_output, MAX_STORED_PROVIDER_OUTPUT_CHARS),
+                    _truncate_nullable(error, MAX_STORED_PROVIDER_ERROR_CHARS),
+                    now,
+                    turn_id,
+                ),
             )
+            if status == "needs-human":
+                next_pr_status = "needs-human"
+            elif status in {"completed", "failed"}:
+                next_pr_status = "unresolved"
+            else:
+                return
+            conn.execute(
+                """
+                update watched_prs
+                set status = ?, updated_at = ?
+                where id = (select watched_pr_id from watch_turns where id = ?)
+                    and status = 'processing'
+                """,
+                (next_pr_status, now, turn_id),
+            )
+
+    def recover_stale_processing(self, *, older_than_seconds: int) -> int:
+        if older_than_seconds < 1:
+            raise ValueError("older_than_seconds must be positive")
+        cutoff = (datetime.now(UTC) - timedelta(seconds=older_than_seconds)).isoformat()
+        now = _now()
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                select id, watched_pr_id
+                from watch_turns
+                where status = 'running'
+                    and starting_head_sha = 'supervisor-tick'
+                    and watched_pr_id in (
+                        select id
+                        from watched_prs
+                        where status = 'processing'
+                    )
+                    and created_at < ?
+                """,
+                (cutoff,),
+            ).fetchall()
+            if not rows:
+                return 0
+            turn_ids = [int(row["id"]) for row in rows]
+            pr_ids = [int(row["watched_pr_id"]) for row in rows]
+            placeholders = ", ".join("?" for _ in turn_ids)
+            conn.execute(
+                f"""
+                update watch_turns
+                set status = 'failed',
+                    error = coalesce(error, 'stale processing recovered'),
+                    completed_at = ?
+                where id in ({placeholders})
+                """,
+                (now, *turn_ids),
+            )
+            pr_placeholders = ", ".join("?" for _ in pr_ids)
+            conn.execute(
+                f"""
+                update watched_prs
+                set status = 'unresolved', updated_at = ?
+                where status = 'processing' and id in ({pr_placeholders})
+                """,
+                (now, *pr_ids),
+            )
+        return len(turn_ids)
+
+    def _claim_supervisor_turn(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        provider: str,
+        model: str | None,
+        pr_id: int | None = None,
+    ) -> tuple[WatchedPullRequest, WatchTurnEvent] | None:
+        now = _now()
+        while True:
+            if pr_id is None:
+                row = conn.execute(
+                    """
+                    select id, max_turns, turns_used
+                    from watched_prs
+                    where status = 'unresolved'
+                    order by created_at, id
+                    limit 1
+                    """
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    """
+                    select id, max_turns, turns_used
+                    from watched_prs
+                    where id = ? and status = 'unresolved'
+                    """,
+                    (pr_id,),
+                ).fetchone()
+            if row is None:
+                return None
+            candidate_id = int(row["id"])
+            if int(row["turns_used"]) >= int(row["max_turns"]):
+                conn.execute(
+                    """
+                    update watched_prs
+                    set status = 'needs-human', updated_at = ?
+                    where id = ? and status = 'unresolved' and turns_used >= max_turns
+                    """,
+                    (now, candidate_id),
+                )
+                if pr_id is not None:
+                    return None
+                continue
+            claimed = conn.execute(
+                """
+                update watched_prs
+                set status = 'processing',
+                    turns_used = turns_used + 1,
+                    updated_at = ?
+                where id = ? and status = 'unresolved' and turns_used < max_turns
+                returning *
+                """,
+                (now, candidate_id),
+            ).fetchone()
+            if claimed is None:
+                if pr_id is not None:
+                    return None
+                continue
             cursor = conn.execute(
                 """
                 insert into watch_turns
-                    (watched_pr_id, turn_number, starting_head_sha, status, created_at)
-                values (?, ?, 'supervisor-tick', 'running', ?)
+                    (watched_pr_id, turn_number, starting_head_sha, status, provider, model,
+                     created_at)
+                values (?, ?, 'supervisor-tick', 'running', ?, ?, ?)
                 """,
-                (pr.id, turn_number, now),
+                (candidate_id, int(claimed["turns_used"]), provider, model, now),
             )
-            row = conn.execute(
+            turn = conn.execute(
                 """
-                select id, turn_number, starting_head_sha, status, created_at, completed_at
+                select
+                    id,
+                    turn_number,
+                    starting_head_sha,
+                    status,
+                    created_at,
+                    completed_at,
+                    provider,
+                    model,
+                    provider_command,
+                    provider_output,
+                    error
                 from watch_turns
                 where id = ?
                 """,
                 (int(cursor.lastrowid),),
             ).fetchone()
-        return _watch_turn_event(row)
-
-    def finish_supervisor_turn(self, turn_id: int, *, status: str) -> None:
-        with self.connect() as conn:
-            conn.execute(
-                """
-                update watch_turns
-                set status = ?, completed_at = ?
-                where id = ?
-                """,
-                (status, _now(), turn_id),
-            )
+            return _watched_pr(claimed), _watch_turn_event(turn)
 
     def record_attempt_diagnostics(
         self,
@@ -725,6 +992,11 @@ def _watch_turn_event(row: sqlite3.Row) -> WatchTurnEvent:
         status=str(row["status"]),
         created_at=str(row["created_at"]),
         completed_at=row["completed_at"],
+        provider=row["provider"],
+        model=row["model"],
+        provider_command=row["provider_command"],
+        provider_output=row["provider_output"],
+        error=row["error"],
     )
 
 
