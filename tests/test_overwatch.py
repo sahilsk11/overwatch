@@ -12,7 +12,8 @@ from fastapi.testclient import TestClient
 
 from overwatch.api import create_app
 from overwatch.cli import main
-from overwatch.github import parse_pr_url
+from overwatch.domain import PullRequestSnapshot
+from overwatch.github import PullRequestRef, parse_pr_url
 from overwatch.providers import AgentConfig, ProviderRegistry
 from overwatch.store import Store
 from overwatch.worker import build_supervisor_prompt, run_tick
@@ -32,6 +33,31 @@ class ExplodingProvider:
 
     async def run(self, prompt: str, config: AgentConfig) -> None:
         raise FileNotFoundError("codex")
+
+
+class FakeGitHub:
+    def __init__(self, *, states: dict[str, tuple[str, bool]] | None = None) -> None:
+        self.states = states or {}
+
+    def get_pr_snapshot(self, pr: PullRequestRef) -> PullRequestSnapshot:
+        state, merged = self.states.get(pr.url, ("open", False))
+        return PullRequestSnapshot(
+            ref=pr,
+            state=state,
+            draft=False,
+            mergeable=True,
+            head_sha="abc123",
+            base_branch="main",
+            merged=merged,
+        )
+
+
+class FailingGitHub:
+    def __init__(self, exception: Exception | None = None) -> None:
+        self.exception = exception or OSError("network unavailable")
+
+    def get_pr_snapshot(self, pr: PullRequestRef) -> PullRequestSnapshot:
+        raise self.exception
 
 
 class StoreTest(unittest.TestCase):
@@ -149,7 +175,7 @@ class WorkerTest(unittest.IsolatedAsyncioTestCase):
             )
             provider = FakeProvider()
 
-            await run_tick(store, registry=ProviderRegistry([provider]))
+            await run_tick(store, github=FakeGitHub(), registry=ProviderRegistry([provider]))
             refreshed = store.get_pr(watched.id)
             turns = store.watch_turns(watched.id)
 
@@ -186,7 +212,7 @@ class WorkerTest(unittest.IsolatedAsyncioTestCase):
             )
             provider = FakeProvider("codex")
 
-            await run_tick(store, registry=ProviderRegistry([provider]))
+            await run_tick(store, github=FakeGitHub(), registry=ProviderRegistry([provider]))
 
         self.assertEqual(len(provider.calls), 1)
         _, config = provider.calls[0]
@@ -203,7 +229,11 @@ class WorkerTest(unittest.IsolatedAsyncioTestCase):
                 harness=None,
             )
 
-            await run_tick(store, registry=ProviderRegistry([ExplodingProvider()]))
+            await run_tick(
+                store,
+                github=FakeGitHub(),
+                registry=ProviderRegistry([ExplodingProvider()]),
+            )
             turns = store.watch_turns(watched.id)
 
         self.assertEqual(len(turns), 1)
@@ -214,7 +244,7 @@ class WorkerTest(unittest.IsolatedAsyncioTestCase):
             store = Store(Path(tmpdir) / "overwatch.sqlite3")
             provider = FakeProvider()
 
-            await run_tick(store, registry=ProviderRegistry([provider]))
+            await run_tick(store, github=FakeGitHub(), registry=ProviderRegistry([provider]))
 
         self.assertEqual(provider.calls, [])
 
@@ -232,7 +262,7 @@ class WorkerTest(unittest.IsolatedAsyncioTestCase):
             store.finish_supervisor_turn(turn.id, status="completed")
             provider = FakeProvider()
 
-            await run_tick(store, registry=ProviderRegistry([provider]))
+            await run_tick(store, github=FakeGitHub(), registry=ProviderRegistry([provider]))
 
             refreshed = store.get_pr(watched.id)
             self.assertIsNotNone(refreshed)
@@ -240,6 +270,86 @@ class WorkerTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(refreshed.status, "needs-human")
             self.assertEqual(refreshed.turns_used, 1)
             self.assertEqual(provider.calls, [])
+
+    async def test_run_tick_marks_merged_and_closed_watches_inactive_before_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = Store(Path(tmpdir) / "overwatch.sqlite3")
+            merged = store.watch_pr(
+                parse_pr_url("https://github.com/example/repo/pull/41"),
+                provider="codex",
+                model="gpt-5.5",
+                harness=None,
+            )
+            closed = store.watch_pr(
+                parse_pr_url("https://github.com/example/repo/pull/42"),
+                provider="codex",
+                model="gpt-5.5",
+                harness=None,
+            )
+            open_watch = store.watch_pr(
+                parse_pr_url("https://github.com/example/repo/pull/43"),
+                provider="codex",
+                model="gpt-5.5",
+                harness=None,
+            )
+            provider = FakeProvider()
+            github = FakeGitHub(
+                states={
+                    merged.url: ("closed", True),
+                    closed.url: ("closed", False),
+                    open_watch.url: ("open", False),
+                }
+            )
+
+            await run_tick(store, github=github, registry=ProviderRegistry([provider]))
+            merged_refreshed = store.get_pr(merged.id)
+            closed_refreshed = store.get_pr(closed.id)
+            open_refreshed = store.get_pr(open_watch.id)
+
+        self.assertIsNotNone(merged_refreshed)
+        self.assertIsNotNone(closed_refreshed)
+        self.assertIsNotNone(open_refreshed)
+        assert merged_refreshed is not None
+        assert closed_refreshed is not None
+        assert open_refreshed is not None
+        self.assertEqual(merged_refreshed.status, "merged")
+        self.assertEqual(closed_refreshed.status, "closed")
+        self.assertEqual(open_refreshed.status, "unresolved")
+        self.assertEqual(open_refreshed.turns_used, 1)
+        self.assertEqual(len(provider.calls), 1)
+        self.assertIn("https://github.com/example/repo/pull/43", provider.calls[0][0])
+        self.assertNotIn("https://github.com/example/repo/pull/41", provider.calls[0][0])
+        self.assertNotIn("https://github.com/example/repo/pull/42", provider.calls[0][0])
+
+    async def test_run_tick_continues_when_pruning_snapshot_lookup_has_network_error(self) -> None:
+        await self._assert_run_tick_continues_after_pruning_error(OSError("network unavailable"))
+
+    async def test_run_tick_continues_when_pruning_snapshot_lookup_has_bad_response(self) -> None:
+        await self._assert_run_tick_continues_after_pruning_error(ValueError("malformed JSON"))
+
+    async def _assert_run_tick_continues_after_pruning_error(self, exception: Exception) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = Store(Path(tmpdir) / "overwatch.sqlite3")
+            watched = store.watch_pr(
+                parse_pr_url("https://github.com/example/repo/pull/42"),
+                provider="codex",
+                model="gpt-5.5",
+                harness=None,
+            )
+            provider = FakeProvider()
+
+            await run_tick(
+                store,
+                github=FailingGitHub(exception),
+                registry=ProviderRegistry([provider]),
+            )
+            refreshed = store.get_pr(watched.id)
+
+        self.assertIsNotNone(refreshed)
+        assert refreshed is not None
+        self.assertEqual(refreshed.status, "unresolved")
+        self.assertEqual(refreshed.turns_used, 1)
+        self.assertEqual(len(provider.calls), 1)
 
     def test_supervisor_prompt_is_cron_friendly(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
