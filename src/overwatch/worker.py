@@ -4,6 +4,7 @@ import asyncio
 import shlex
 from dataclasses import dataclass
 
+from overwatch.github import GitHubClient, PullRequestRef
 from overwatch.providers import (
     AgentConfig,
     ProviderRegistry,
@@ -37,10 +38,12 @@ async def run_tick(
     model: str | None = DEFAULT_MODEL,
     max_attempts_per_sha: int | None = None,
 ) -> None:
-    _ = github, max_attempts_per_sha
+    _ = max_attempts_per_sha
     provider_id = provider_id or DEFAULT_PROVIDER
     model = model if model is not None else DEFAULT_MODEL
+    github = github or GitHubClient()
     store.init()
+    prune_inactive_watches(store, github=github)
     store.recover_stale_processing(older_than_seconds=STALE_PROCESSING_SECONDS)
     watches = _claim_runnable_watches(store, provider=provider_id, model=model)
     if not watches:
@@ -154,6 +157,24 @@ End with what changed, tests run, whether you pushed, and anything still blocked
 
 def _yes_no(value: bool) -> str:
     return "yes" if value else "no"
+
+
+def prune_inactive_watches(store: Store, *, github: object) -> None:
+    for watch in store.unresolved_prs():
+        pr = PullRequestRef(
+            owner=watch.owner,
+            repo=watch.repo,
+            number=watch.number,
+            url=watch.url,
+        )
+        try:
+            snapshot = github.get_pr_snapshot(pr)
+        except (RuntimeError, OSError, ValueError):
+            continue
+        if snapshot.merged:
+            store.mark_inactive(watch.id, status="merged")
+        elif snapshot.state.lower() == "closed":
+            store.mark_inactive(watch.id, status="closed")
 
 
 def _claim_runnable_watches(
