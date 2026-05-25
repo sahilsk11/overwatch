@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
+import socket
 import sqlite3
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -183,6 +185,14 @@ class Store:
                     created_at text not null,
                     completed_at text
                 );
+
+                create table if not exists worker_heartbeats (
+                    id integer primary key autoincrement,
+                    worker_id text not null unique,
+                    hostname text not null,
+                    pid integer not null,
+                    updated_at text not null
+                );
                 """
             )
             _ensure_column(
@@ -268,6 +278,44 @@ class Store:
             )
             row = conn.execute("select * from watched_prs where url = ?", (pr.url,)).fetchone()
         return _watched_pr(row)
+
+    def record_worker_heartbeat(self, *, worker_id: str | None = None) -> str:
+        self.init()
+        worker_id = worker_id or _default_worker_id()
+        now = _now()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                insert into worker_heartbeats (worker_id, hostname, pid, updated_at)
+                values (?, ?, ?, ?)
+                on conflict(worker_id) do update set
+                    hostname = excluded.hostname,
+                    pid = excluded.pid,
+                    updated_at = excluded.updated_at
+                """,
+                (worker_id, socket.gethostname(), os.getpid(), now),
+            )
+        return worker_id
+
+    def has_active_worker(self, *, max_age_seconds: int = 300) -> bool:
+        self.init()
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                select worker_id, hostname, pid, updated_at
+                from worker_heartbeats
+                order by updated_at desc, id desc
+                """
+            ).fetchall()
+        cutoff = datetime.now(UTC) - timedelta(seconds=max_age_seconds)
+        current_host = socket.gethostname()
+        for row in rows:
+            updated_at = _parse_timestamp(row["updated_at"])
+            if updated_at is None or updated_at < cutoff:
+                continue
+            if str(row["hostname"]) == current_host and _pid_exists(int(row["pid"])):
+                return True
+        return False
 
     def unresolved_prs(self) -> list[WatchedPullRequest]:
         self.init()
@@ -745,15 +793,38 @@ def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _default_worker_id() -> str:
+    return f"{socket.gethostname()}:{os.getpid()}"
+
+
+def _parse_timestamp(value: str) -> datetime | None:
+    try:
+        timestamp = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=UTC)
+    return timestamp
+
+
+def _pid_exists(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 def _elapsed_seconds(started_at: str | None) -> int | None:
     if not started_at:
         return None
-    try:
-        started = datetime.fromisoformat(started_at)
-    except ValueError:
+    started = _parse_timestamp(started_at)
+    if started is None:
         return None
-    if started.tzinfo is None:
-        started = started.replace(tzinfo=UTC)
     return max(0, int((datetime.now(UTC) - started).total_seconds()))
 
 

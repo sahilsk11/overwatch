@@ -16,10 +16,14 @@ overwatch --tick
 overwatch --serve
 ```
 
-Run the agent loop from cron:
+Adding a watch requires an active local worker heartbeat. If no worker is
+running, the CLI refuses the watch instead of silently storing work that no
+process will pick up.
 
-```cron
-* * * * /path/to/overwatch --tick
+Run the worker continuously:
+
+```sh
+overwatch --worker
 ```
 
 `--tick` loads unresolved watches from `~/.overwatch/overwatch.sqlite3`, starts one supervisor agent, and gives it a prompt that says:

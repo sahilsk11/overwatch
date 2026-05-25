@@ -138,6 +138,11 @@ def main() -> None:
     warning = _session_warning(args.session_strategy)
     if warning:
         print(warning, file=sys.stderr)
+    if not store.has_active_worker():
+        parser.error(
+            "refusing to watch PR because no active Overwatch worker is running; "
+            "start one with `overwatch --worker`"
+        )
     watched = store.watch_pr(
         pr,
         provider=args.provider,

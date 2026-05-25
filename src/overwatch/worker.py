@@ -51,9 +51,11 @@ async def run_tick(
 def run_forever(store: Store, *, interval_seconds: int = 300) -> None:
     async def loop() -> None:
         while True:
+            store.record_worker_heartbeat()
             await run_tick(store)
             await asyncio.sleep(interval_seconds)
 
+    store.record_worker_heartbeat()
     asyncio.run(loop())
 
 

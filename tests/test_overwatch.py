@@ -4,7 +4,7 @@ import io
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -68,15 +68,71 @@ class StoreTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_pr_url("https://github.com/example/repo/issues/42")
 
+    def test_worker_heartbeat_marks_worker_active(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = Store(Path(tmpdir) / "overwatch.sqlite3")
+
+            self.assertFalse(store.has_active_worker())
+            store.record_worker_heartbeat()
+
+            self.assertTrue(store.has_active_worker())
+
 
 class CliTest(unittest.TestCase):
-    def test_cli_adds_and_lists_watch(self) -> None:
+    def test_cli_adds_watch_when_worker_is_active(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "overwatch.sqlite3"
+            Store(db_path).record_worker_heartbeat()
+            add_argv = [
+                "overwatch",
+                "--db",
+                str(db_path),
+                "--context",
+                "Use the original chat.",
+                "--max-turns",
+                "5",
+                "https://github.com/example/repo/pull/42",
+            ]
+            output = io.StringIO()
+
+            with patch.object(sys, "argv", add_argv), redirect_stdout(output):
+                main()
+            watched = Store(db_path).watched_prs(include_inactive=True)[0]
+
+        self.assertIn("watching https://github.com/example/repo/pull/42", output.getvalue())
+        self.assertEqual(watched.max_turns, 5)
+
+    def test_cli_refuses_watch_when_no_worker_is_active(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "overwatch.sqlite3"
+            add_argv = [
+                "overwatch",
+                "--db",
+                str(db_path),
+                "https://github.com/example/repo/pull/42",
+            ]
+            stderr = io.StringIO()
+
+            with (
+                patch.object(sys, "argv", add_argv),
+                redirect_stderr(stderr),
+                self.assertRaises(SystemExit) as raised,
+            ):
+                main()
+            watched = Store(db_path).watched_prs(include_inactive=True)
+
+        self.assertEqual(raised.exception.code, 2)
+        self.assertEqual(watched, [])
+        self.assertIn("no active Overwatch worker is running", stderr.getvalue())
+
+    def test_cli_lists_watch(self) -> None:
         class ListGitHubClient:
             def get_unresolved_review_threads(self, pr: object) -> list[object]:
                 return []
 
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "overwatch.sqlite3"
+            Store(db_path).record_worker_heartbeat()
             add_argv = [
                 "overwatch",
                 "--db",
