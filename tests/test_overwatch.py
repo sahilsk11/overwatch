@@ -12,19 +12,39 @@ from fastapi.testclient import TestClient
 
 from overwatch.api import create_app
 from overwatch.cli import main
-from overwatch.github import parse_pr_url
-from overwatch.providers import AgentConfig, ProviderRegistry
+from overwatch.github import CiStatus, parse_pr_url
+from overwatch.providers import AgentConfig, ProviderRegistry, ProviderRunError, ProviderRunResult
 from overwatch.store import Store
 from overwatch.worker import build_supervisor_prompt, run_tick
 
 
 class FakeProvider:
-    def __init__(self, provider_id: str = "codex") -> None:
+    def __init__(
+        self,
+        provider_id: str = "codex",
+        result: ProviderRunResult | None = None,
+    ) -> None:
         self.provider_id = provider_id
+        self.result = result or ProviderRunResult(
+            command="codex exec --model gpt-5.5",
+            output="supervisor completed",
+        )
         self.calls: list[tuple[str, AgentConfig]] = []
 
-    async def run(self, prompt: str, config: AgentConfig) -> None:
+    async def run(self, prompt: str, config: AgentConfig) -> ProviderRunResult:
         self.calls.append((prompt, config))
+        return self.result
+
+
+class FailingProvider:
+    provider_id = "codex"
+
+    async def run(self, prompt: str, config: AgentConfig) -> ProviderRunResult:
+        result = ProviderRunResult(
+            command="codex exec --model gpt-5.5",
+            output="stdout:\npartial supervisor log\n\nstderr:\nprovider failed",
+        )
+        raise ProviderRunError("codex exited with 1", result)
 
 
 class ExplodingProvider:
@@ -67,6 +87,124 @@ class StoreTest(unittest.TestCase):
     def test_parse_pr_url_rejects_non_pull_request_url(self) -> None:
         with self.assertRaises(ValueError):
             parse_pr_url("https://github.com/example/repo/issues/42")
+
+    def test_supervisor_claim_prevents_duplicate_processing_claims(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = Store(Path(tmpdir) / "overwatch.sqlite3")
+            watched = store.watch_pr(
+                parse_pr_url("https://github.com/example/repo/pull/42"),
+                provider="codex",
+                model="gpt-5.5",
+                harness=None,
+            )
+
+            claimed = store.claim_supervisor_turn(provider="codex", model="gpt-5.5")
+            duplicate = store.claim_supervisor_turn(provider="codex", model="gpt-5.5")
+            with self.assertRaises(RuntimeError):
+                store.start_supervisor_turn(watched)
+
+        self.assertIsNotNone(claimed)
+        assert claimed is not None
+        claimed_watch, claimed_turn = claimed
+        self.assertEqual(claimed_watch.id, watched.id)
+        self.assertEqual(claimed_watch.status, "processing")
+        self.assertEqual(claimed_watch.turns_used, 1)
+        self.assertEqual(claimed_turn.status, "running")
+        self.assertEqual(claimed_turn.provider, "codex")
+        self.assertEqual(claimed_turn.model, "gpt-5.5")
+        self.assertIsNone(duplicate)
+
+    def test_supervisor_finish_persists_logs_and_releases_processing_watch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = Store(Path(tmpdir) / "overwatch.sqlite3")
+            watched = store.watch_pr(
+                parse_pr_url("https://github.com/example/repo/pull/42"),
+                provider="codex",
+                model="gpt-5.5",
+                harness=None,
+            )
+            claimed = store.claim_supervisor_turn(provider="codex", model="gpt-5.5")
+            assert claimed is not None
+            _, turn = claimed
+
+            store.finish_supervisor_turn(
+                turn.id,
+                status="failed",
+                provider_command="codex exec",
+                provider_output="supervisor output",
+                error="provider failed",
+            )
+            refreshed = store.get_pr(watched.id)
+            turns = store.watch_turns(watched.id)
+
+        self.assertIsNotNone(refreshed)
+        assert refreshed is not None
+        self.assertEqual(refreshed.status, "unresolved")
+        self.assertEqual(turns[0].status, "failed")
+        self.assertEqual(turns[0].provider_command, "codex exec")
+        self.assertEqual(turns[0].provider_output, "supervisor output")
+        self.assertEqual(turns[0].error, "provider failed")
+        self.assertIsNotNone(turns[0].completed_at)
+
+    def test_supervisor_claim_skips_exhausted_watches_and_marks_needs_human(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = Store(Path(tmpdir) / "overwatch.sqlite3")
+            exhausted = store.watch_pr(
+                parse_pr_url("https://github.com/example/repo/pull/41"),
+                provider="codex",
+                model="gpt-5.5",
+                harness=None,
+                max_turns=1,
+            )
+            runnable = store.watch_pr(
+                parse_pr_url("https://github.com/example/repo/pull/42"),
+                provider="codex",
+                model="gpt-5.5",
+                harness=None,
+            )
+            turn = store.start_supervisor_turn(exhausted)
+            store.finish_supervisor_turn(turn.id, status="completed")
+
+            claimed = store.claim_supervisor_turn(provider="codex", model="gpt-5.5")
+            exhausted_refreshed = store.get_pr(exhausted.id)
+
+        self.assertIsNotNone(claimed)
+        assert claimed is not None
+        claimed_watch, _ = claimed
+        self.assertEqual(claimed_watch.id, runnable.id)
+        self.assertIsNotNone(exhausted_refreshed)
+        assert exhausted_refreshed is not None
+        self.assertEqual(exhausted_refreshed.status, "needs-human")
+
+    def test_recover_stale_processing_marks_turn_failed_and_releases_watch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = Store(Path(tmpdir) / "overwatch.sqlite3")
+            watched = store.watch_pr(
+                parse_pr_url("https://github.com/example/repo/pull/42"),
+                provider="codex",
+                model="gpt-5.5",
+                harness=None,
+            )
+            claimed = store.claim_supervisor_turn(provider="codex", model="gpt-5.5")
+            assert claimed is not None
+            _, turn = claimed
+            old_timestamp = "2000-01-01T00:00:00+00:00"
+            with store.connect() as conn:
+                conn.execute(
+                    "update watch_turns set created_at = ? where id = ?",
+                    (old_timestamp, turn.id),
+                )
+
+            recovered = store.recover_stale_processing(older_than_seconds=1)
+            refreshed = store.get_pr(watched.id)
+            turns = store.watch_turns(watched.id)
+
+        self.assertEqual(recovered, 1)
+        self.assertIsNotNone(refreshed)
+        assert refreshed is not None
+        self.assertEqual(refreshed.status, "unresolved")
+        self.assertEqual(turns[0].status, "failed")
+        self.assertEqual(turns[0].error, "stale processing recovered")
 
 
 class CliTest(unittest.TestCase):
@@ -133,6 +271,62 @@ class ApiTest(unittest.TestCase):
         self.assertIn(refresh_response.status_code, {404, 405})
         self.assertIn(pause_response.status_code, {404, 405})
 
+    def test_api_events_include_supervisor_turn_logs_and_processing_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = Store(Path(tmpdir) / "overwatch.sqlite3")
+            watched = store.watch_pr(
+                parse_pr_url("https://github.com/example/repo/pull/42"),
+                provider="codex",
+                model="gpt-5.5",
+                harness=None,
+            )
+            store.record_ci_status(
+                watched.id,
+                CiStatus(
+                    state="failure",
+                    head_sha="abc123456789",
+                    summary="checks failed",
+                    details={"workflow": "test"},
+                ),
+            )
+            claimed = store.claim_supervisor_turn(provider="codex", model="gpt-5.5")
+            assert claimed is not None
+            _, turn = claimed
+            app = create_app(store=store, static_dir=Path(tmpdir) / "static")
+
+            with TestClient(app) as client:
+                listed = client.get("/api/prs")
+                detail = client.get(f"/api/prs/{watched.id}")
+
+                store.finish_supervisor_turn(
+                    turn.id,
+                    status="failed",
+                    provider_command="codex exec --model gpt-5.5",
+                    provider_output="supervisor output",
+                    error="provider failed",
+                )
+                events = client.get(f"/api/prs/{watched.id}/events")
+
+        self.assertEqual(listed.status_code, 200)
+        listed_payload = listed.json()
+        self.assertEqual(listed_payload[0]["status"], "processing")
+        self.assertEqual(listed_payload[0]["worker_status"], "running")
+        self.assertEqual(listed_payload[0]["active_attempt_status"], "running")
+        self.assertEqual(detail.status_code, 200)
+        self.assertEqual(detail.json()["worker_status"], "running")
+        self.assertEqual(events.status_code, 200)
+        events_payload = events.json()
+        self.assertEqual(events_payload["ci_history"][0]["summary"], "checks failed")
+        self.assertEqual(events_payload["resolution_attempts"], [])
+        self.assertEqual(len(events_payload["watch_turns"]), 1)
+        turn_payload = events_payload["watch_turns"][0]
+        self.assertEqual(turn_payload["status"], "failed")
+        self.assertEqual(turn_payload["provider"], "codex")
+        self.assertEqual(turn_payload["model"], "gpt-5.5")
+        self.assertEqual(turn_payload["provider_command"], "codex exec --model gpt-5.5")
+        self.assertEqual(turn_payload["provider_output"], "supervisor output")
+        self.assertEqual(turn_payload["error"], "provider failed")
+
 
 class WorkerTest(unittest.IsolatedAsyncioTestCase):
     async def test_run_tick_launches_one_supervisor_agent(self) -> None:
@@ -152,6 +346,7 @@ class WorkerTest(unittest.IsolatedAsyncioTestCase):
             await run_tick(store, registry=ProviderRegistry([provider]))
             refreshed = store.get_pr(watched.id)
             turns = store.watch_turns(watched.id)
+            listed = store.watched_prs(include_inactive=True)
 
         self.assertEqual(len(provider.calls), 1)
         prompt, config = provider.calls[0]
@@ -174,6 +369,10 @@ class WorkerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(turns), 1)
         self.assertEqual(turns[0].starting_head_sha, "supervisor-tick")
         self.assertEqual(turns[0].status, "completed")
+        self.assertEqual(turns[0].provider_command, "codex exec --model gpt-5.5")
+        self.assertEqual(turns[0].provider_output, "supervisor completed")
+        self.assertEqual(listed[0].last_provider_command, "codex exec --model gpt-5.5")
+        self.assertEqual(listed[0].last_provider_output, "supervisor completed")
 
     async def test_run_tick_uses_codex_supervisor_provider(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -208,6 +407,29 @@ class WorkerTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(turns), 1)
         self.assertEqual(turns[0].status, "failed")
+        self.assertEqual(turns[0].error, "codex")
+
+    async def test_run_tick_records_provider_failure_logs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = Store(Path(tmpdir) / "overwatch.sqlite3")
+            watched = store.watch_pr(
+                parse_pr_url("https://github.com/example/repo/pull/42"),
+                provider="codex",
+                model="gpt-5.5",
+                harness=None,
+            )
+
+            await run_tick(store, registry=ProviderRegistry([FailingProvider()]))
+            turns = store.watch_turns(watched.id)
+            listed = store.watched_prs(include_inactive=True)
+
+        self.assertEqual(len(turns), 1)
+        self.assertEqual(turns[0].status, "failed")
+        self.assertEqual(turns[0].provider_command, "codex exec --model gpt-5.5")
+        self.assertIn("partial supervisor log", turns[0].provider_output or "")
+        self.assertEqual(turns[0].error, "codex exited with 1")
+        self.assertIn("partial supervisor log", listed[0].last_provider_output or "")
+        self.assertEqual(listed[0].last_error, "codex exited with 1")
 
     async def test_run_tick_does_nothing_without_active_watches(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -217,6 +439,48 @@ class WorkerTest(unittest.IsolatedAsyncioTestCase):
             await run_tick(store, registry=ProviderRegistry([provider]))
 
         self.assertEqual(provider.calls, [])
+
+    async def test_run_tick_skips_already_processing_watch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = Store(Path(tmpdir) / "overwatch.sqlite3")
+            processing = store.watch_pr(
+                parse_pr_url("https://github.com/example/repo/pull/42"),
+                provider="codex",
+                model="gpt-5.5",
+                harness=None,
+            )
+            runnable = store.watch_pr(
+                parse_pr_url("https://github.com/example/repo/pull/43"),
+                provider="codex",
+                model="gpt-5.5",
+                harness=None,
+            )
+            claimed = store.claim_supervisor_turn(provider="codex", model="gpt-5.5")
+            assert claimed is not None
+            provider = FakeProvider()
+
+            await run_tick(store, registry=ProviderRegistry([provider]))
+            processing_refreshed = store.get_pr(processing.id)
+            runnable_refreshed = store.get_pr(runnable.id)
+            processing_turns = store.watch_turns(processing.id)
+            runnable_turns = store.watch_turns(runnable.id)
+
+        self.assertEqual(len(provider.calls), 1)
+        prompt, _ = provider.calls[0]
+        self.assertNotIn("https://github.com/example/repo/pull/42", prompt)
+        self.assertIn("https://github.com/example/repo/pull/43", prompt)
+        self.assertIsNotNone(processing_refreshed)
+        assert processing_refreshed is not None
+        self.assertEqual(processing_refreshed.status, "processing")
+        self.assertEqual(processing_refreshed.turns_used, 1)
+        self.assertIsNotNone(runnable_refreshed)
+        assert runnable_refreshed is not None
+        self.assertEqual(runnable_refreshed.status, "unresolved")
+        self.assertEqual(runnable_refreshed.turns_used, 1)
+        self.assertEqual(len(processing_turns), 1)
+        self.assertEqual(processing_turns[0].status, "running")
+        self.assertEqual(len(runnable_turns), 1)
+        self.assertEqual(runnable_turns[0].status, "completed")
 
     async def test_run_tick_marks_exhausted_watches_needs_human(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
