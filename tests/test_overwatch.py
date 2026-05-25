@@ -53,8 +53,11 @@ class FakeGitHub:
 
 
 class FailingGitHub:
+    def __init__(self, exception: Exception | None = None) -> None:
+        self.exception = exception or OSError("network unavailable")
+
     def get_pr_snapshot(self, pr: PullRequestRef) -> PullRequestSnapshot:
-        raise OSError("network unavailable")
+        raise self.exception
 
 
 class StoreTest(unittest.TestCase):
@@ -319,6 +322,12 @@ class WorkerTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("https://github.com/example/repo/pull/42", provider.calls[0][0])
 
     async def test_run_tick_continues_when_pruning_snapshot_lookup_has_network_error(self) -> None:
+        await self._assert_run_tick_continues_after_pruning_error(OSError("network unavailable"))
+
+    async def test_run_tick_continues_when_pruning_snapshot_lookup_has_bad_response(self) -> None:
+        await self._assert_run_tick_continues_after_pruning_error(ValueError("malformed JSON"))
+
+    async def _assert_run_tick_continues_after_pruning_error(self, exception: Exception) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = Store(Path(tmpdir) / "overwatch.sqlite3")
             watched = store.watch_pr(
@@ -329,7 +338,11 @@ class WorkerTest(unittest.IsolatedAsyncioTestCase):
             )
             provider = FakeProvider()
 
-            await run_tick(store, github=FailingGitHub(), registry=ProviderRegistry([provider]))
+            await run_tick(
+                store,
+                github=FailingGitHub(exception),
+                registry=ProviderRegistry([provider]),
+            )
             refreshed = store.get_pr(watched.id)
 
         self.assertIsNotNone(refreshed)
