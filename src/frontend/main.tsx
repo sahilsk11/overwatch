@@ -46,6 +46,8 @@ interface PullRequestSummary {
   merge_on_bot_approval?: boolean;
   max_turns?: number;
   turns_used?: number;
+  created_at?: string | null;
+  updated_at?: string | null;
   latest_ci_state?: string | null;
   latest_head_sha?: string | null;
   latest_summary?: string | null;
@@ -62,10 +64,7 @@ interface PullRequestSummary {
   last_error?: string | null;
 }
 
-interface PullRequestDetail extends PullRequestSummary {
-  created_at?: string | null;
-  updated_at?: string | null;
-}
+interface PullRequestDetail extends PullRequestSummary {}
 
 interface CiHistoryEvent {
   id: string | number;
@@ -265,7 +264,7 @@ function LoadingRows() {
 }
 
 function App() {
-  const [bucket, setBucket] = React.useState<Bucket>("all");
+  const [bucket, setBucket] = React.useState<Bucket>("active");
   const [prs, setPrs] = React.useState<Loadable<PullRequestSummary[]>>({
     data: [],
     loading: true,
@@ -341,7 +340,7 @@ function App() {
     const needle = query.trim().toLowerCase();
     if (!needle) return prs.data;
     return prs.data.filter((pr) =>
-      [prLabel(pr), pr.url, pr.status, pr.latest_ci_state, pr.latest_summary]
+      [prLabel(pr), pr.url, pr.status, pr.latest_ci_state, pr.latest_summary, pr.created_at]
         .filter(Boolean)
         .some((value) => String(value).toLowerCase().includes(needle)),
     );
@@ -408,9 +407,9 @@ function App() {
                     {prLabel(pr)}
                   </span>
                   <span className="pr-subtitle">{pr.latest_summary || pr.url}</span>
+                  <span className="pr-added">Added {formatDate(pr.created_at)}</span>
                 </span>
                 <span className="pr-meta">
-                  <StatusPill value={pr.latest_ci_state ?? pr.status} />
                   <ChevronRight aria-hidden="true" />
                 </span>
               </button>

@@ -308,7 +308,7 @@ input:focus {
 .pr-main {
   display: grid;
   min-width: 0;
-  gap: 6px;
+  gap: 5px;
 }
 
 .pr-title {
@@ -323,6 +323,13 @@ input:focus {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.pr-added {
+  color: #7f7f7f;
+  font-size: 12px;
+  font-weight: 800;
+  text-transform: uppercase;
 }
 
 .pr-meta {
