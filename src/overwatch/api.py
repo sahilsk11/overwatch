@@ -1,20 +1,16 @@
 from __future__ import annotations
 
 import os
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict
 
-from overwatch.github import GitHubClient, PullRequestRef, parse_pr_url
 from overwatch.store import (
-    DEFAULT_MODEL,
-    DEFAULT_PROVIDER,
-    DEFAULT_SESSION_STRATEGY,
     DONE_STATUSES,
     Store,
     WatchedPullRequest,
@@ -23,24 +19,9 @@ from overwatch.store import (
 )
 
 PrBucket = Literal["active", "done", "all"]
-SessionStrategy = Literal["fresh", "context-summary", "attached-session"]
 
 class HealthResponse(BaseModel):
     status: Literal["ok"]
-
-
-class WatchPrRequest(BaseModel):
-    url: str
-    provider: str = DEFAULT_PROVIDER
-    model: str | None = DEFAULT_MODEL
-    harness: str | None = None
-    context: str | None = None
-    context_summary: str = ""
-    session_strategy: SessionStrategy = DEFAULT_SESSION_STRATEGY
-    session_id: str | None = None
-    autofix: bool = False
-    merge_on_bot_approval: bool = False
-    max_turns: int = Field(default=3, ge=1, le=10)
 
 
 class PrResponse(BaseModel):
@@ -149,11 +130,6 @@ class PrEventsResponse(BaseModel):
     resolution_attempts: list[ResolutionAttemptResponse]
 
 
-class RefreshResponse(BaseModel):
-    pr: PrResponse
-    ci_status: CiHistoryResponse
-
-
 def default_static_dir() -> Path:
     return Path(__file__).resolve().parent / "static"
 
@@ -176,18 +152,12 @@ def _store_dependency(request: Request) -> Store:
     return request.app.state.store
 
 
-def _github_dependency(request: Request) -> GitHubClient:
-    return request.app.state.github_factory()
-
-
 StoreDependency = Annotated[Store, Depends(_store_dependency)]
-GitHubDependency = Annotated[GitHubClient, Depends(_github_dependency)]
 
 
 def create_app(
     *,
     store: Store | None = None,
-    github_factory: Callable[[], GitHubClient] = GitHubClient,
     static_dir: Path | None = None,
 ) -> FastAPI:
     @asynccontextmanager
@@ -197,7 +167,6 @@ def create_app(
 
     app = FastAPI(title="Overwatch API", lifespan=lifespan)
     app.state.store = store or Store(configured_db_path())
-    app.state.github_factory = github_factory
     app.state.static_dir = static_dir or configured_static_dir()
 
     @app.get("/api/health", response_model=HealthResponse)
@@ -230,99 +199,6 @@ def create_app(
                 ResolutionAttemptResponse.model_validate(attempt) for attempt in attempts
             ],
         )
-
-    @app.post("/api/prs", response_model=PrResponse, status_code=status.HTTP_201_CREATED)
-    def watch_pr(
-        request: WatchPrRequest,
-        store: StoreDependency,
-    ) -> PrResponse:
-        try:
-            pr = parse_pr_url(request.url)
-        except ValueError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                detail=str(exc),
-            ) from exc
-        try:
-            watched = store.watch_pr(
-                pr,
-                provider=request.provider,
-                model=request.model,
-                harness=request.harness,
-                context_summary=_request_context_summary(request),
-                session_strategy=request.session_strategy,
-                session_id=request.session_id,
-                autofix=request.autofix,
-                merge_on_bot_approval=request.merge_on_bot_approval,
-                max_turns=request.max_turns,
-            )
-        except ValueError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                detail=str(exc),
-            ) from exc
-        return _pr_response_or_404(store, watched.id)
-
-    @app.post("/api/prs/{pr_id}/refresh", response_model=RefreshResponse)
-    def refresh_pr(
-        pr_id: int,
-        store: StoreDependency,
-        github: GitHubDependency,
-    ) -> RefreshResponse:
-        watched = _get_pr_or_404(store, pr_id)
-        pr_ref = PullRequestRef(
-            owner=watched.owner,
-            repo=watched.repo,
-            number=watched.number,
-            url=watched.url,
-        )
-        try:
-            ci_status = github.get_ci_status(pr_ref)
-        except RuntimeError as exc:
-            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
-        store.record_ci_status(watched.id, ci_status)
-        if ci_status.merged:
-            store.mark_inactive(watched.id, status="merged")
-        elif ci_status.pr_state == "closed":
-            store.mark_inactive(watched.id, status="closed")
-        ci_history, _attempts = store.pr_events(watched.id)
-        return RefreshResponse(
-            pr=_pr_response_or_404(store, pr_id),
-            ci_status=CiHistoryResponse.model_validate(ci_history[0]),
-        )
-
-    @app.post("/api/prs/{pr_id}/pause", response_model=PrResponse)
-    def pause_pr(pr_id: int, store: StoreDependency) -> PrResponse:
-        try:
-            store.pause_watch(pr_id)
-        except ValueError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                detail=str(exc),
-            ) from exc
-        return _pr_response_or_404(store, pr_id)
-
-    @app.post("/api/prs/{pr_id}/resume", response_model=PrResponse)
-    def resume_pr(pr_id: int, store: StoreDependency) -> PrResponse:
-        try:
-            store.resume_watch(pr_id)
-        except ValueError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                detail=str(exc),
-            ) from exc
-        return _pr_response_or_404(store, pr_id)
-
-    @app.post("/api/prs/{pr_id}/stop", response_model=PrResponse)
-    def stop_pr(pr_id: int, store: StoreDependency) -> PrResponse:
-        try:
-            store.stop_watch(pr_id)
-        except ValueError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                detail=str(exc),
-            ) from exc
-        return _pr_response_or_404(store, pr_id)
 
     @app.get("/{path:path}", include_in_schema=False)
     def serve_spa(path: str, request: Request) -> FileResponse:
@@ -366,15 +242,6 @@ def _pr_response_or_404(store: Store, pr_id: int) -> PrResponse:
             }
         )
     return PrResponse.model_validate(payload)
-
-
-def _request_context_summary(request: WatchPrRequest) -> str:
-    parts = [
-        value.strip()
-        for value in (request.context_summary, request.context or "")
-        if value.strip()
-    ]
-    return "\n\n".join(parts)
 
 
 def _static_response(static_dir: Path, path: str) -> FileResponse:

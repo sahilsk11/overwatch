@@ -9,12 +9,8 @@ import {
   Clock3,
   GitPullRequest,
   Loader2,
-  Pause,
-  Play,
-  Plus,
   RefreshCw,
   Search,
-  Square,
   TerminalSquare,
   X,
 } from "lucide-react";
@@ -110,14 +106,6 @@ interface PrEventsPayload {
   resolution_attempts?: ResolutionAttempt[];
 }
 
-interface CreatePrRequest {
-  url: string;
-  provider?: string;
-  model?: string;
-  autofix: boolean;
-  merge_on_bot_approval: boolean;
-}
-
 interface Loadable<T> {
   data: T;
   loading: boolean;
@@ -211,21 +199,6 @@ async function fetchPrEvents(id: string | number): Promise<PrEvent[]> {
   return [];
 }
 
-async function createPr(body: CreatePrRequest): Promise<PullRequestSummary> {
-  return requestJson<PullRequestSummary>("/api/prs", {
-    method: "POST",
-    body: JSON.stringify(body),
-  });
-}
-
-async function refreshPr(id: string | number): Promise<void> {
-  await requestJson<void>(`/api/prs/${id}/refresh`, { method: "POST" });
-}
-
-async function controlPr(id: string | number, action: "pause" | "resume" | "stop"): Promise<void> {
-  await requestJson<void>(`/api/prs/${id}/${action}`, { method: "POST" });
-}
-
 function formatDate(value?: string | null): string {
   if (!value) return "never";
   const date = new Date(value);
@@ -311,19 +284,6 @@ function App() {
   });
   const [health, setHealth] = React.useState<HealthStatus>("checking");
   const [query, setQuery] = React.useState("");
-  const [refreshingId, setRefreshingId] = React.useState<string | number | null>(null);
-  const [controlBusy, setControlBusy] = React.useState<string | null>(null);
-  const [form, setForm] = React.useState<CreatePrRequest>({
-    url: "",
-    provider: "codex",
-    model: "gpt-5.5",
-    autofix: false,
-    merge_on_bot_approval: false,
-  });
-  const [formState, setFormState] = React.useState<{ saving: boolean; error: string | null }>({
-    saving: false,
-    error: null,
-  });
 
   const loadPrs = React.useCallback(async () => {
     setPrs((current) => ({ ...current, loading: true, error: null }));
@@ -387,40 +347,6 @@ function App() {
     );
   }, [prs.data, query]);
 
-  async function handleCreatePr(event: React.FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    setFormState({ saving: true, error: null });
-    try {
-      const created = await createPr(form);
-      setForm({ ...form, url: "" });
-      setFormState({ saving: false, error: null });
-      await loadPrs();
-      setSelectedId(created.id);
-    } catch (error) {
-      setFormState({ saving: false, error: errorMessage(error) });
-    }
-  }
-
-  async function handleRefresh(id: string | number) {
-    setRefreshingId(id);
-    try {
-      await refreshPr(id);
-      await Promise.all([loadPrs(), loadDetail(id)]);
-    } finally {
-      setRefreshingId(null);
-    }
-  }
-
-  async function handleControl(id: string | number, action: "pause" | "resume" | "stop") {
-    setControlBusy(`${action}:${id}`);
-    try {
-      await controlPr(id, action);
-      await Promise.all([loadPrs(), loadDetail(id)]);
-    } finally {
-      setControlBusy(null);
-    }
-  }
-
   return (
     <main className="shell">
       <header className="topbar">
@@ -449,64 +375,6 @@ function App() {
 
       <section className="layout">
         <aside className="left-panel">
-          <form className="add-form" onSubmit={handleCreatePr}>
-            <div className="panel-title">
-              <Plus aria-hidden="true" />
-              <span>Add PR</span>
-            </div>
-            <label>
-              <span>GitHub URL</span>
-              <input
-                required
-                type="url"
-                value={form.url}
-                onChange={(event) => setForm({ ...form, url: event.target.value })}
-                placeholder="https://github.com/owner/repo/pull/123"
-              />
-            </label>
-            <div className="form-grid">
-              <label>
-                <span>Provider</span>
-                <input
-                  value={form.provider ?? ""}
-                  onChange={(event) => setForm({ ...form, provider: event.target.value })}
-                />
-              </label>
-              <label>
-                <span>Model</span>
-                <input
-                  value={form.model ?? ""}
-                  onChange={(event) => setForm({ ...form, model: event.target.value })}
-                />
-              </label>
-            </div>
-            <div className="toggles">
-              <label className="check">
-                <input
-                  type="checkbox"
-                  checked={form.autofix}
-                  onChange={(event) => setForm({ ...form, autofix: event.target.checked })}
-                />
-                <span>Autofix failures</span>
-              </label>
-              <label className="check">
-                <input
-                  type="checkbox"
-                  checked={form.merge_on_bot_approval}
-                  onChange={(event) =>
-                    setForm({ ...form, merge_on_bot_approval: event.target.checked })
-                  }
-                />
-                <span>Merge on bot approval</span>
-              </label>
-            </div>
-            {formState.error ? <p className="form-error">{formState.error}</p> : null}
-            <button type="submit" className="primary" disabled={formState.saving}>
-              {formState.saving ? <Loader2 className="spin" /> : <Plus />}
-              Track PR
-            </button>
-          </form>
-
           <div className="list-toolbar">
             <div className="search">
               <Search aria-hidden="true" />
@@ -554,10 +422,6 @@ function App() {
           detail={detail}
           events={events}
           selectedId={selectedId}
-          refreshingId={refreshingId}
-          controlBusy={controlBusy}
-          onRefresh={handleRefresh}
-          onControl={handleControl}
           onRetry={() => selectedId !== null && loadDetail(selectedId)}
         />
       </section>
@@ -569,19 +433,11 @@ function DetailPanel({
   detail,
   events,
   selectedId,
-  refreshingId,
-  controlBusy,
-  onRefresh,
-  onControl,
   onRetry,
 }: {
   detail: Loadable<PullRequestDetail | null>;
   events: Loadable<PrEvent[]>;
   selectedId: string | number | null;
-  refreshingId: string | number | null;
-  controlBusy: string | null;
-  onRefresh: (id: string | number) => void;
-  onControl: (id: string | number, action: "pause" | "resume" | "stop") => void;
   onRetry: () => void;
 }) {
   if (selectedId === null) {
@@ -630,47 +486,6 @@ function DetailPanel({
             {pr.url}
           </a>
         </div>
-        <div className="action-row">
-          <button
-            type="button"
-            className="primary"
-            onClick={() => onRefresh(pr.id)}
-            disabled={refreshingId === pr.id}
-          >
-            {refreshingId === pr.id ? <Loader2 className="spin" /> : <RefreshCw />}
-            Refresh
-          </button>
-          {pr.status === "paused" ? (
-            <button
-              type="button"
-              className="ghost"
-              onClick={() => onControl(pr.id, "resume")}
-              disabled={controlBusy === `resume:${pr.id}`}
-            >
-              {controlBusy === `resume:${pr.id}` ? <Loader2 className="spin" /> : <Play />}
-              Resume
-            </button>
-          ) : (
-            <button
-              type="button"
-              className="ghost"
-              onClick={() => onControl(pr.id, "pause")}
-              disabled={pr.status === "stopped" || controlBusy === `pause:${pr.id}`}
-            >
-              {controlBusy === `pause:${pr.id}` ? <Loader2 className="spin" /> : <Pause />}
-              Pause
-            </button>
-          )}
-          <button
-            type="button"
-            className="ghost"
-            onClick={() => onControl(pr.id, "stop")}
-            disabled={pr.status === "stopped" || controlBusy === `stop:${pr.id}`}
-          >
-            {controlBusy === `stop:${pr.id}` ? <Loader2 className="spin" /> : <Square />}
-            Stop
-          </button>
-        </div>
       </div>
 
       <div className="metric-grid">
@@ -710,7 +525,7 @@ function DetailPanel({
             <StatusPill value={pr.latest_ci_state} />
           </div>
         ) : (
-          <EmptyState title="No check yet" detail="Refresh this PR to record its current CI state." />
+          <EmptyState title="No check yet" detail="No CI snapshot has been recorded." />
         )}
       </section>
 
@@ -741,7 +556,7 @@ function DetailPanel({
               ))}
             </div>
           ) : (
-            <EmptyState title="No events" detail="Refresh activity and worker decisions will appear here." />
+            <EmptyState title="No events" detail="Agent activity will appear here after it is recorded." />
           )}
         </div>
 

@@ -481,6 +481,59 @@ class Store:
             )
             return int(cursor.lastrowid)
 
+    def start_supervisor_turn(self, pr: WatchedPullRequest) -> WatchTurnEvent:
+        with self.connect() as conn:
+            row = conn.execute(
+                "select status, max_turns, turns_used from watched_prs where id = ?",
+                (pr.id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"watched PR {pr.id} does not exist")
+            if str(row["status"]) != "unresolved":
+                raise RuntimeError(f"watch is {row['status']}")
+            turns_used = int(row["turns_used"])
+            max_turns = int(row["max_turns"])
+            if turns_used >= max_turns:
+                raise RuntimeError("turn budget exhausted")
+            turn_number = turns_used + 1
+            now = _now()
+            conn.execute(
+                """
+                update watched_prs
+                set turns_used = ?, updated_at = ?
+                where id = ?
+                """,
+                (turn_number, now, pr.id),
+            )
+            cursor = conn.execute(
+                """
+                insert into watch_turns
+                    (watched_pr_id, turn_number, starting_head_sha, status, created_at)
+                values (?, ?, 'supervisor-tick', 'running', ?)
+                """,
+                (pr.id, turn_number, now),
+            )
+            row = conn.execute(
+                """
+                select id, turn_number, starting_head_sha, status, created_at, completed_at
+                from watch_turns
+                where id = ?
+                """,
+                (int(cursor.lastrowid),),
+            ).fetchone()
+        return _watch_turn_event(row)
+
+    def finish_supervisor_turn(self, turn_id: int, *, status: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                update watch_turns
+                set status = ?, completed_at = ?
+                where id = ?
+                """,
+                (status, _now(), turn_id),
+            )
+
     def record_attempt_diagnostics(
         self,
         attempt_id: int,

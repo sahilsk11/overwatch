@@ -16,7 +16,7 @@ from overwatch.store import (
     Store,
     default_db_path,
 )
-from overwatch.worker import run_forever, run_once
+from overwatch.worker import run_forever, run_tick
 
 
 def main() -> None:
@@ -59,10 +59,11 @@ def main() -> None:
         help="Existing session ID for --session-strategy attached-session",
     )
     parser.add_argument(
-        "--turns",
+        "--max-turns",
+        dest="max_turns",
         type=_turn_budget,
         default=3,
-        help="Maximum provider turns for this watch, from 1 to 10",
+        help="Maximum supervisor turns for this watch, from 1 to 10",
     )
     parser.add_argument(
         "--autofix",
@@ -74,7 +75,7 @@ def main() -> None:
         action="store_true",
         help="Merge after CI passes if the latest supported bot review approves the PR",
     )
-    parser.add_argument("--run-once", action="store_true", help="Check unresolved PRs once")
+    parser.add_argument("--tick", action="store_true", help="Run one supervisor agent tick")
     parser.add_argument("--worker", action="store_true", help="Run the polling worker")
     parser.add_argument("--serve", action="store_true", help="Run the FastAPI backend")
     parser.add_argument("--pause", metavar="WATCH", help="Pause a watch by database ID or PR URL")
@@ -113,8 +114,8 @@ def main() -> None:
         print(f"stopped {watched.url}")
         return
 
-    if args.run_once:
-        asyncio.run(run_once(store))
+    if args.tick:
+        asyncio.run(run_tick(store))
         return
     if args.worker:
         run_forever(store, interval_seconds=args.interval)
@@ -126,7 +127,7 @@ def main() -> None:
         _print_watched_prs(store, include_inactive=args.all)
         return
     if not args.pr_link:
-        parser.error("provide a GitHub PR URL, 'list', --run-once, or --worker")
+        parser.error("provide a GitHub PR URL, 'list', --tick, --worker, or --serve")
 
     pr = parse_pr_url(args.pr_link)
     context_summary = _context_summary(args.context, args.context_file)
@@ -147,7 +148,7 @@ def main() -> None:
         session_id=args.session_id,
         autofix=args.autofix,
         merge_on_bot_approval=args.merge_on_bot_approval,
-        max_turns=args.turns,
+        max_turns=args.max_turns,
     )
     print(
         f"watching {watched.url} with {watched.provider} "
@@ -216,9 +217,9 @@ def _turn_budget(value: str) -> int:
     try:
         turns = int(value)
     except ValueError as exc:
-        raise argparse.ArgumentTypeError("--turns must be an integer") from exc
+        raise argparse.ArgumentTypeError("--max-turns must be an integer") from exc
     if turns < 1 or turns > 10:
-        raise argparse.ArgumentTypeError("--turns must be between 1 and 10")
+        raise argparse.ArgumentTypeError("--max-turns must be between 1 and 10")
     return turns
 
 
