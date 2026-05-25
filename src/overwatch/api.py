@@ -80,6 +80,8 @@ class PrSummaryResponse(BaseModel):
     merge_on_bot_approval: bool
     max_turns: int
     turns_used: int
+    created_at: str
+    updated_at: str
     latest_ci_state: str | None
     latest_head_sha: str | None
     latest_summary: str | None
