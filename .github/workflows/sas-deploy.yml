@@ -16,4 +16,4 @@ jobs:
       - name: trigger SAS deploy
         env:
           GH_TOKEN: ${{ secrets.SAS_DEPLOY_TOKEN }}
-        run: gh workflow run deploy.yml --repo sahilsk11/sas --field tags=overwatch
+        run: gh workflow run deploy.yml --repo sahilsk11/sas --ref main --field tags=overwatch
