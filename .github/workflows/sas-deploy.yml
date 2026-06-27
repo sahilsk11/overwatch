@@ -1,0 +1,19 @@
+name: sas-deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: sas-deploy-trigger
+  cancel-in-progress: false
+
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: trigger SAS deploy
+        env:
+          GH_TOKEN: ${{ secrets.SAS_DEPLOY_TOKEN }}
+        run: gh workflow run deploy.yml --repo sahilsk11/sas --field tags=overwatch
